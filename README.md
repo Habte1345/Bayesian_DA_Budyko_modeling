@@ -1,92 +1,43 @@
-#### AWI Open Source Project Template Instructions
+# 🌊 Hydrologic Data Assimilation with Two-Store Model and Budyko Constraint (TwoStore-EnKF-Model)
 
-1. Create a new project, doing one of the following:
-   1. When creating the new repository, use this template to initialize it.
-   2. Clone this repository and copy the contents to a new repository manually.
-2. Update the README, replacing the contents below as prescribed.
-3. Add any libraries, assets, or hard dependencies whose source code will be included in the project's repository to [Credits And References](#credits-and-references) section.
-   1. If there are no such dependencies, consider including a statement to that effect.
-4. Delete these instructions and everything up to the _Project Title_ from the README.
-5. Write some great software and tell people about it.
+This repository contains a modular Python implementation of a simple **Two-Store Hydrologic Model** coupled with an **Ensemble Kalman Filter (EnKF)** for state and parameter estimation, including a scenario constrained by the **Budyko hypothesis**.
 
-> Keep the README fresh! It's the first thing people see and will make the initial impression.
+## Features
+* **Modular Design:** Code separated into distinct modules (`model.py`, `enkf.py`, `budyko.py`).
+* **EnKF Implementation:** Supports joint state/parameter estimation.
+* **Budyko Constraint:** Includes a scenario where Evapotranspiration (ET) is constrained by a dynamically estimated Budyko parameter ($\omega$).
 
-----
+## 🚀 Getting Started
 
-# Project Title
+### Prerequisites
+* Python 3.8+
+* The required libraries listed in `requirements.txt`.
 
-**Description**:  Put a meaningful, short, plain-language description of what
-this project is trying to accomplish and why it matters.
-Describe the problem(s) this project solves.
-Describe how this software can improve the lives of its audience.
+### Installation
+1.  Clone the repository:
+    ```bash
+    git clone [https://github.com/YourUsername/Hydrologic-DA-Budyko.git](https://github.com/YourUsername/Hydrologic-DA-Budyko.git)
+    cd Hydrologic-DA-Budyko
+    ```
+2.  Create and activate a virtual environment (recommended).
+3.  Install dependencies:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-Other things to include:
+### Running the Simulation
+1.  Place your input data CSV files (P, PET, Q_NLDAS, Q_USGS, etc.) in the `data/` folder.
+2.  Edit the data loading section in `scripts/run_simulation.py` to match your data file names.
+3.  Execute the main script:
+    ```bash
+    python scripts/run_simulation.py
+    ```
 
-- **Technology stack**: Indicate the technological nature of the software, including primary programming language(s) and whether the software is intended as standalone or as a module in a framework or other ecosystem.
-- **Status**:  Alpha, Beta, 1.1, etc. It's OK to write a sentence, too. The goal is to let interested people know where this project is at. This is also a good place to link to the [CHANGELOG](CHANGELOG.md).
-- **Links to production or demo instances**
-- Describe what sets this apart from related-projects. Linking to another doc or page is OK if this can't be expressed in a sentence or two.
+## 📚 Code Structure
 
-**Screenshot**: If the software has visual components, place a screenshot after the description; e.g.,
-
-![Example screenshot of a repository](doc/Screenshot.png)
-
-## Dependencies
-
-Describe any dependencies that must be installed for this software to work.
-This includes programming languages, databases or other storage mechanisms, build tools, frameworks, and so forth.
-If specific versions of other software are required, or known not to work, call that out.
-
-## Installation
-
-Detailed instructions on how to install, configure, and get the project running.
-This should be frequently tested to ensure reliability. Alternatively, link to
-a separate [INSTALL](INSTALL.md) document.
-
-## Configuration
-
-If the software is configurable, describe it in detail, either here or in other documentation to which you link.
-
-## Usage
-
-Show users how to use the software.
-Be specific.
-Use appropriate formatting when showing code snippets.
-
-## How to test the software
-
-If the software includes automated tests, detail how to run those tests.
-
-## Known issues
-
-Document any known significant shortcomings with the software.
-
-## Getting help
-
-Instruct users how to get help with this software; this might include links to an issue tracker, wiki, mailing list, etc.
-
-### Example
-
-If you have questions, concerns, bug reports, etc, please file an issue in this repository's Issue Tracker.
-
-## Getting involved
-
-This section should detail why people should get involved and describe key areas you are
-currently focusing on; e.g., trying to get feedback on features, fixing certain bugs, building
-important pieces, etc.
-
-General instructions on _how_ to contribute should be stated with a link to [CONTRIBUTING](CONTRIBUTING.md).
-
-----
-
-## Open source licensing info
-
-1. [LICENSE](LICENSE)
-
-----
-
-## Credits and references
-
-1. Projects that inspired you
-2. Related projects
-3. Books, papers, talks, or other sources that have meaningful impact or influence on this project
+| File | Primary Classes/Functions | Description |
+| :--- | :--- | :--- |
+| `src/model.py` | `ModelParams`, `run_two_store_model` | Defines the hydrologic model structure and stepping function. |
+| `src/enkf.py` | `EnKFConfig`, `enkf_update` | Implements the Ensemble Kalman Filter logic. |
+| `src/budyko.py` | `fu_budyko`, `fit_omega_mlr` | Functions related to the Budyko equation and omega regression. |
+| `src/metrics.py` | `calculate_nse`, `calculate_kge` | Calculates Nash-Sutcliffe Efficiency (NSE) and Kling-Gupta Efficiency (KGE). |
