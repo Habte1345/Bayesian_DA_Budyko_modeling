@@ -10,7 +10,7 @@ import numpy as np
 @dataclass
 class ModelParams:
     """Dataclass for storing the hydrologic model parameters."""
-    Smax: float = 500.0  # Max storage in the soil store
+    Smax: float = 10.0  # Max storage in the soil store
     Kperc: float = 0.05  # Percolation rate
     Kb: float = 0.06     # Baseflow recession constant
     Ke: float = 0.7      # Evaporation coefficient
