@@ -1,0 +1,2 @@
+*.nc filter=lfs diff=lfs merge=lfs -text
+data/input_data/*.csv filter=lfs diff=lfs merge=lfs -text
