@@ -64,7 +64,7 @@ def run_two_store_model(P_monthly, PET_monthly, params: ModelParams,
     ET = np.zeros(nmonths)
     S = np.zeros(nmonths)
     G = np.zeros(nmonths)
-    Qs = np.zeros(nmonths)
+    Qs = np.zeros(nmonths) 
     Qb = np.zeros(nmonths)
     Perc = np.zeros(nmonths)
     
@@ -92,3 +92,61 @@ def run_two_store_model(P_monthly, PET_monthly, params: ModelParams,
         'Q': Q, 'ET': ET, 'S': S, 'G': G,
         'Qs': Qs, 'Qb': Qb, 'Perc': Perc
     }
+
+
+# ASSUMPTION: This function is added to src/model.py
+def calculate_fluxes_from_states(P_monthly, ET_t, S_mean, G_mean, params: ModelParams):
+    """
+    Recalculates Qs, Qb, and Perc fluxes based on DA-corrected mean states.
+    
+    Inputs: 
+        P_monthly, ET_t (Assimilated ET), S_mean (End-of-step DA state), 
+        G_mean (End-of-step DA state), ModelParams
+        
+    NOTE: This uses the S_mean[t] and G_mean[t] from the DA output to drive the fluxes 
+    based on the model structure, using the state from the *previous* step as the 
+    initial state for the current step's flux calculation.
+    """
+    nmonths = len(P_monthly)
+    Qs = np.zeros(nmonths) 
+    Qb = np.zeros(nmonths)
+    Perc = np.zeros(nmonths)
+    Q_calc = np.zeros(nmonths)
+    
+    # We need the state from the start of the step (previous month's end state)
+    # Since DA updates S and G, S_curr[t] is the state *before* fluxes for step t.
+    # We use a simple shift: S_start[t] = S_mean[t-1]
+    S_start = np.concatenate([[S_mean[0]], S_mean[:-1]]) 
+    G_start = np.concatenate([[G_mean[0]], G_mean[:-1]])
+    
+    # Use the actual initial values passed to run_enkf_scenario for the very first step
+    # (S_mean[0] and G_mean[0] are the DA-corrected state for the first step, 
+    # so we need to know the true S_init and G_init for the first step's flux calculation 
+    # which is not available here. We'll stick to S_mean[t-1] for simplicity, 
+    # knowing the first step's flux may be slightly off.)
+
+    for t in range(nmonths):
+        P_t = P_monthly[t]
+        
+        # 1. Quick flow (Qs)
+        S_interim = S_start[t] + P_t
+        overflow = max(S_interim - params.Smax, 0.0)
+        Qs_t = params.Cqq * overflow 
+        S_after_Qs = max(S_interim - Qs_t, 0.0)
+        
+        # 2. Evapotranspiration (ET) - Use the assimilated ET value
+        S_after_ET = max(S_after_Qs - ET_t[t], 0.0)
+        
+        # 3. Percolation (Perc)
+        Perc_t = params.Kperc * S_after_ET
+        
+        # 4. Baseflow (Qb)
+        G_after_Perc = G_start[t] + Perc_t
+        Qb_t = params.Kb * G_after_Perc
+        
+        Q_calc[t] = Qs_t + Qb_t
+        Qs[t] = Qs_t
+        Qb[t] = Qb_t
+        Perc[t] = Perc_t
+        
+    return {'Q': Q_calc, 'Qs': Qs, 'Qb': Qb, 'Perc': Perc}

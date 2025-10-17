@@ -302,13 +302,13 @@ class EnKFConfig:
     
     # MOVED and CORRECTED: This field uses default_factory. Set to ZERO for FIXED PARAMETERS.
     param_rw_sd: np.ndarray = field(
-        default_factory=lambda: np.array([10.0, 0.0, 0.0, 0.0, 0.0, 0.4, 0.2]) 
+        default_factory=lambda: np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) 
         # Index:                        [S, G, Kperc, Kb, Ke, Cqq, bias]
     )
     
     # 2. DEFAULT ARGUMENTS (These come last)
-    R_Q: float = 10.0 
-    R_ET: float = 5.0 
+    R_Q: float = 0.5
+    R_ET: float = 0.1 
     inflation: float = 1.05
 
 
@@ -333,8 +333,8 @@ def enkf_update(X: np.ndarray, y_obs: float, HX: np.ndarray,
     X_updated = X + K @ innovation.reshape(1, -1)
     
     # 4. Constraints (State and Parameter bounds)
-    X_updated[0, :] = np.clip(X_updated[0, :], 0.0, 1500.0) # S 
-    X_updated[1, :] = np.clip(X_updated[1, :], 0.0, 2000.0) # G 
+    X_updated[0, :] = np.clip(X_updated[0, :], 0.0, 2000.0) # S 
+    X_updated[1, :] = np.clip(X_updated[1, :], 0.0, 25000.0) # G 
     X_updated[2, :] = np.clip(X_updated[2, :], 0.001, 0.999) # Kperc 
     X_updated[3, :] = np.clip(X_updated[3, :], 0.001, 0.999) # Kb 
     X_updated[4, :] = np.clip(X_updated[4, :], 0.01, 1.0) # Ke 
@@ -360,7 +360,7 @@ def enkf_forecast_step(X_ens, P_t, PET_t, ET_B_t=None) -> tuple:
         Cqq = X_ens[5, i]
         bias = X_ens[6, i]
         
-        params = ModelParams(Smax=500.0, Kperc=Kperc, Kb=Kb, Ke=Ke, Cqq=Cqq)
+        params = ModelParams(Smax=150.0, Kperc=Kperc, Kb=Kb, Ke=Ke, Cqq=Cqq)
         
         ET_override = ET_B_t if ET_B_t is not None else None
         
@@ -398,8 +398,8 @@ def run_enkf_scenario(P_monthly, PET_monthly, Q_obs_nldas, ET_B_monthly,
         cal_params = {'Kperc': 0.25, 'Kb': 0.15, 'Ke': 0.80, 'Cqq': 1.50, 'Bias': 1.0}
 
     # Assign loaded (or fallback) values
-    CALIBRATED_KPERC = cal_params.get('Kperc', 0.25)
-    CALIBRATED_KB    = cal_params.get('Kb', 0.15)
+    CALIBRATED_KPERC = cal_params.get('Kperc', 0.8)
+    CALIBRATED_KB    = cal_params.get('Kb', 0.7)
     CALIBRATED_KE    = cal_params.get('Ke', 0.80)
     CALIBRATED_CQQ   = cal_params.get('Cqq', 1.50)
     CALIBRATED_BIAS  = cal_params.get('Bias', 1.0)
