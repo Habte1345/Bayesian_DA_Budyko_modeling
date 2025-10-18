@@ -7,7 +7,8 @@ from typing import Dict, Any
 # Get the path to the project root (Bayesian_DA_Budyko_modeling)
 # Assuming this file is at PROJECT_ROOT/src/param_manager.py
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-RESULTS_DIR = os.path.join(PROJECT_ROOT, 'SCE_UA_Results')
+RESULTS_DIR = os.path.join(PROJECT_ROOT, 'SCE_cal_params')
+
 
 def get_calibrated_params_for_basin(basin_id: str) -> Dict[str, float]:
     """

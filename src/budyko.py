@@ -53,7 +53,7 @@ def solve_omega_true(P, PET, ET_ke, Qb):
             omega_solution, infodict, ier, msg = fsolve(objective_func, x0=2.5, full_output=True)
             if ier == 1:
                 omega = omega_solution[0]
-                omega_true[np.where(valid_idx)[0][i]] = np.clip(omega, 1.0, 10.0)
+                omega_true[np.where(valid_idx)[0][i]] = np.clip(omega, 0.1, 1000000.0)
         except:
             pass
 

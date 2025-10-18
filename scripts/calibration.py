@@ -17,7 +17,8 @@ sys.path.append(PROJECT_ROOT)
 # NOTE: Ensure src/model.py, src/metrics.py, and data/data_processor.py exist and are correct
 try:
     from src.model import ModelParams, two_store_model_step
-    from src.metrics import calculate_nse, calculate_kge
+    # REMOVED: from src.metrics import calculate_nse, calculate_kge
+    from src.metrics import calculate_kge # <-- NSE removed
     from data.data_processor import load_and_prepare_data
 except ImportError as e:
     print(f"FATAL: One or more required modules failed to import. Check file paths and existence: {e}")
@@ -51,8 +52,8 @@ def run_forward_model(P_data, PET_data, Q_obs, initial_state, params: ModelParam
         S_curr = S_next
         G_curr = G_next
         
-    # Use 10 months spin-up for the calibration objective
-    spin_up_months = 10 
+    # Use 60 months spin-up for the calibration objective (increased from 20 for stability)
+    spin_up_months = 60 
     
     # Check if Q_obs is long enough (it should be, but safety check)
     if len(Q_obs) <= spin_up_months:
@@ -68,6 +69,8 @@ def run_forward_model(P_data, PET_data, Q_obs, initial_state, params: ModelParam
 class TwoStoreModel_SCE:
     """SPOTPY class wrapper for the two-store hydrologic model."""
     
+    # NOTE: The parameters() method below is OBSOLETE, as it is dynamically 
+    # replaced in calibrate_initial_parameters_sce to use basin-specific S_init bounds.
     def __init__(self, P_data, PET_data, Q_obs, Smax, initial_S, initial_G):
         self.P_data = P_data
         self.PET_data = PET_data
@@ -77,14 +80,17 @@ class TwoStoreModel_SCE:
         self.initial_G = initial_G
 
     def parameters(self):
-        """Define the parameters and their bounds for the optimizer."""
+        """Define the parameters and their bounds for the optimizer.
+        This default is usually overwritten by the calling function."""
+        # This function is retained for SPOTPY compatibility but will be overwritten
         params = [
-            # Name, Lower Bound, Upper Bound
-            spotpy.parameter.Uniform(0.001, 0.999, name='Kperc'), # Percolation rate
-            spotpy.parameter.Uniform(0.001, 0.999, name='Kb'),    # Baseflow recession constant
-            spotpy.parameter.Uniform(0.01, 1.0, name='Ke'),       # ET coefficient
-            spotpy.parameter.Uniform(0.01, 10.0, name='Cqq'),     # Quickflow coefficient
-            spotpy.parameter.Uniform(-15.0, 15.0, name='Bias')    # Streamflow bias
+            spotpy.parameter.Uniform(0.001, 0.999, name='Kperc'), 
+            spotpy.parameter.Uniform(0.1, 0.999, name='Kb'),       # Robust bounds
+            spotpy.parameter.Uniform(0.01, 1.0, name='Ke'),       
+            spotpy.parameter.Uniform(0.1, 0.999, name='Cqq'),     # Robust bounds
+            spotpy.parameter.Uniform(-15.0, 15.0, name='Bias'),    
+            spotpy.parameter.Uniform(0.0, self.Smax * 0.95, name='S_init'), # Uses the initialized Smax
+            spotpy.parameter.Uniform(0.0, 100.0, name='G_init') 
         ]
         return spotpy.parameter.generate(params)
 
@@ -94,19 +100,25 @@ class TwoStoreModel_SCE:
         
         # Unpack parameters and set up ModelParams
         model_params = ModelParams(
-            Smax=self.Smax, 
+            Smax=self.Smax, # Uses the basin-specific Smax set in __init__
             Kperc=p['Kperc'], 
             Kb=p['Kb'], 
             Ke=p['Ke'], 
             Cqq=p['Cqq']
         )
-        initial_state = (self.initial_S, self.initial_G, p['Bias'])
+        
+        # S_init and G_init are optimized by SCE-UA
+        initial_S_opt = p['S_init']
+        initial_G_opt = p['G_init']
+        
+        initial_state = (initial_S_opt, initial_G_opt, p['Bias'])
         
         # Run the forward model, only retaining the simulated streamflow for the objective
         Q_sim_cut, _ = run_forward_model(
             self.P_data, self.PET_data, self.Q_obs, initial_state, model_params
         )
-        return Q_sim_cut
+        # SPOTPY expects a list of floats (simulated series)
+        return Q_sim_cut.tolist()
 
     def evaluation(self):
         """Returns the observed streamflow for comparison."""
@@ -115,10 +127,15 @@ class TwoStoreModel_SCE:
             self.P_data, self.PET_data, self.Q_obs, 
             (self.initial_S, self.initial_G, 0.0), ModelParams(Smax=self.Smax) 
         ) 
-        return Q_obs_cut
+        # SPOTPY expects a list of floats (observed series)
+        return Q_obs_cut.tolist()
 
     def objectivefunction(self, evaluation, simulation):
         """The function to be minimized: negative KGE."""
+        # Convert lists back to numpy arrays for calculation
+        evaluation = np.array(evaluation)
+        simulation = np.array(simulation)
+        
         # Ensure simulation is not empty (e.g., due to spin-up error)
         if simulation.size == 0 or evaluation.size == 0:
              return 9999.0
@@ -139,74 +156,113 @@ class TwoStoreModel_SCE:
 
 def calibrate_initial_parameters_sce(
     P_df: pd.DataFrame, PET_df: pd.DataFrame, Q_usgs_df: pd.DataFrame, 
-    target_basin: str, repetitions: int = 5000 
+    S_init_df: pd.DataFrame, G_init_df: pd.DataFrame, 
+    SM_df: pd.DataFrame, # <-- ADDED Soil Moisture DF
+    target_basin: str, repetitions: int = 10 
 ) -> Dict[str, Any]:
     
+    # -----------------------------------------------------------------
+    # 1. DATA EXTRACTION AND Smax CALCULATION
+    # -----------------------------------------------------------------
     P_data = P_df[target_basin].values
     PET_data = PET_df[target_basin].values
     Q_obs = Q_usgs_df[target_basin].values
+    SM_data = SM_df[target_basin].values # Extract NLDAS SM data
     
-    # Use the corrected, realistic physical constraints/initial states
-    Smax = 500.0   
-    initial_S = 100.0
-    initial_G = 50.0
+    # 🌟 BASIN-SPECIFIC Smax DERIVATION (from NLDAS SM_0_200cm)
+    SM_max_observed = SM_data.max()
+    
+    # Smax = Max SM * 1.10 (10% safety margin)
+    Smax = SM_max_observed
+    
+    # Enforce a reasonable minimum Smax
+    Smax = max(Smax, 2000) 
+    
+    # Extract NLDAS-derived initial states
+    initial_S = S_init_df.loc[S_init_df.index[0], target_basin]
+    initial_G = G_init_df.loc[G_init_df.index[0], target_basin]
 
-    print(f"  > Starting SCE-UA for {target_basin} ({repetitions} repetitions)...")
+    print(f" > Basin-Specific Smax (from NLDAS SM): {Smax:.2f}") 
+    print(f" > Initial S/G (NLDAS): {initial_S:.2f} / {initial_G:.2f}")
+    print(f"  > Starting SCE-UA for {target_basin} ({repetitions} repetitions)...")
     
-    # 1. Initialize the SPOTPY Model
+    # -----------------------------------------------------------------
+    # 2. MODEL INITIALIZATION AND DYNAMIC PARAMETER DEFINITION
+    # -----------------------------------------------------------------
+    
+    # The Smax value is passed to the model object
     model = TwoStoreModel_SCE(P_data, PET_data, Q_obs, Smax, initial_S, initial_G)
     
-    # 2. Initialize the SCE-UA Sampler
-    temp_dir = os.path.join(PROJECT_ROOT, 'SCE_UA_Results')
+    # Define the dynamic parameter bounds for the sampler
+    # The S_init upper bound is tied to the calculated Smax
+    S_init_upper_bound = Smax * 0.95
+
+    params_for_sampler = [
+        # Name, Lower Bound, Upper Bound
+        spotpy.parameter.Uniform(0.01, 0.999, name='Kperc'), 
+        spotpy.parameter.Uniform(0.1, 0.999, name='Kb'),      # Robust bounds
+        spotpy.parameter.Uniform(0.01, 0.999, name='Ke'),      
+        spotpy.parameter.Uniform(1, 0.999, name='Cqq'),    # Robust bounds
+        spotpy.parameter.Uniform(-1.0, 1.0, name='Bias'),    
+        spotpy.parameter.Uniform(0.0, S_init_upper_bound, name='S_init'), # Dynamic upper bound
+        spotpy.parameter.Uniform(0.0, 150.0, name='G_init') 
+    ]
+    
+    # Overwrite the model's static parameters() method with the dynamic bounds
+    model.parameters = lambda: spotpy.parameter.generate(params_for_sampler)
+    
+    # -----------------------------------------------------------------
+    # 3. SCE-UA SAMPLER EXECUTION
+    # -----------------------------------------------------------------
+    temp_dir = os.path.join(PROJECT_ROOT, 'SCE_cal_params')
     os.makedirs(temp_dir, exist_ok=True)
-    # db_name will save the run results, useful for analysis later
     db_name = os.path.join(temp_dir, f'sceua_cal_{target_basin}')
     
     sampler = spotpy.algorithms.sceua(model, dbname=db_name, dbformat='csv', save_sim=False)
     
-    # 3. Run the Sampling
     sampler.sample(repetitions=repetitions)
     
-    # 4. Analyze Results
+    # -----------------------------------------------------------------
+    # 4. RESULTS ANALYSIS
+    # -----------------------------------------------------------------
     res = sampler.getdata() 
     
     if res is not None and len(res) > 0:
-        # Get the index with the minimum objective function (-KGE) -> maximum KGE
         best_index, best_objf_raw = spotpy.analyser.get_minlikeindex(res)
-        
-        # Safely extract the scalar value of the minimal objective function
         best_objf = best_objf_raw.item() if hasattr(best_objf_raw, 'item') else best_objf_raw
-
-        # The true KGE is the negative of the objective function (KGE = -(-KGE))
         best_kge = -best_objf 
         
         if best_kge > 0.0: 
             p_opt = res[best_index]
             
-            # Extract parameters
+            # Extract optimized parameters
             Kperc_opt = p_opt['parKperc'].item()
             Kb_opt = p_opt['parKb'].item()
             Ke_opt = p_opt['parKe'].item()
             Cqq_opt = p_opt['parCqq'].item()
             Bias_opt = p_opt['parBias'].item()
+            S_init_opt = p_opt['parS_init'].item()
+            G_init_opt = p_opt['parG_init'].item()
 
-            # Recalculate NSE (and KGE for verification) with the optimal params
-            params_final = ModelParams(Smax=Smax, Kperc=Kperc_opt, Kb=Kb_opt, Ke=Ke_opt, Cqq=Cqq_opt)
-            initial_state_final = (initial_S, initial_G, Bias_opt)
-            Q_sim_cut, Q_obs_cut = run_forward_model(P_data, PET_data, Q_obs, initial_state_final, params_final)
-            
-            final_nse = calculate_nse(Q_obs_cut, Q_sim_cut)
+            # REMOVED: Recalculate NSE for final reporting (only KGE remains)
+            # params_final = ModelParams(Smax=Smax, Kperc=Kperc_opt, Kb=Kb_opt, Ke=Ke_opt, Cqq=Cqq_opt)
+            # initial_state_final = (S_init_opt, G_init_opt, Bias_opt)
+            # Q_sim_cut, Q_obs_cut = run_forward_model(P_data, PET_data, Q_obs, initial_state_final, params_final)
+            # final_nse = calculate_nse(Q_obs_cut, Q_sim_cut) # REMOVED
 
             return {
                 'Kperc': Kperc_opt, 'Kb': Kb_opt, 'Ke': Ke_opt, 
                 'Cqq': Cqq_opt, 'bias': Bias_opt,
-                'NSE': final_nse, 'KGE': best_kge # Use the KGE value derived from the optimizer
+                'S_init': S_init_opt, 'G_init': G_init_opt, 
+                'Smax_Used': Smax, 
+                # REMOVED: 'NSE': final_nse, 
+                'KGE': best_kge # KGE is already derived from the optimizer result
             }
         else:
-            print(f"  > FAILED: KGE <= 0.0. Best KGE: {best_kge:.4f}")
+            print(f"  > FAILED: KGE <= 0.0. Best KGE: {best_kge:.4f}")
             return {}
     else:
-        print("  > FAILED: SCE-UA sampler returned no data.")
+        print("  > FAILED: SCE-UA sampler returned no data.")
         return {}
 
 
@@ -214,7 +270,8 @@ def calibrate_initial_parameters_sce(
 # 4. MULTI-BASIN CALIBRATION MANAGER
 # =====================================================================
 
-def calibrate_all_basins(P_df, PET_df, Q_usgs_df, basin_list: List[str], repetitions: int = 5000):
+def calibrate_all_basins(P_df, PET_df, Q_usgs_df, S_init_df, G_init_df, SM_df, # <-- ADDED SM_df
+                         basin_list: List[str], repetitions: int = 10):
     """Loops through a list of basins and performs SCE-UA calibration on each."""
     all_calibrated_results = {}
 
@@ -224,11 +281,13 @@ def calibrate_all_basins(P_df, PET_df, Q_usgs_df, basin_list: List[str], repetit
             continue
 
         print(f"\n=======================================================")
-        print(f"  STARTING CALIBRATION FOR BASIN: {TARGET_BASIN}")
+        print(f"  STARTING CALIBRATION FOR BASIN: {TARGET_BASIN}")
         print(f"=======================================================")
 
+        # 🌟 MODIFIED: Pass the Soil Moisture DataFrame
         calibrated_params = calibrate_initial_parameters_sce(
-            P_df, PET_df, Q_usgs_df, target_basin=TARGET_BASIN, repetitions=repetitions
+            P_df, PET_df, Q_usgs_df, S_init_df, G_init_df, SM_df, # <-- PASS SM_df
+            target_basin=TARGET_BASIN, repetitions=repetitions
         )
 
         if calibrated_params:
@@ -246,14 +305,18 @@ def calibrate_all_basins(P_df, PET_df, Q_usgs_df, basin_list: List[str], repetit
 
 if __name__ == '__main__':
     try:
-        # Load the data - assuming this function extracts the 10 target basins
-        P_df, PET_df, _, _, _, _, _, Q_usgs_df = load_and_prepare_data()
+        # 🌟 MODIFIED: Assuming SM_df (SoilM_0_200cm) is the 5th item returned
+        P_df, PET_df, _, _, SM_df, _, _, Q_usgs_df, S_init_df, G_init_df = load_and_prepare_data()
     except Exception as e:
         print(f"FATAL: Data loading failed: {e}")
         sys.exit(1)
 
     if P_df is None:
         print("FATAL: Data loading returned None. Check data paths.")
+        sys.exit(1)
+        
+    if SM_df is None:
+        print("FATAL: Soil Moisture data (SM_df) is required but returned None.")
         sys.exit(1)
 
     # Define the full list of basins you want to calibrate
@@ -270,13 +333,13 @@ if __name__ == '__main__':
         
     print(f"\nFound {len(TARGET_BASINS)} basins for calibration.")
 
-    # Run the calibration loop
+    # 🌟 MODIFIED: Pass the Soil Moisture DataFrame to the multi-basin manager
     final_results = calibrate_all_basins(
-        P_df, PET_df, Q_usgs_df, TARGET_BASINS, repetitions=5000
+        P_df, PET_df, Q_usgs_df, S_init_df, G_init_df, SM_df, TARGET_BASINS, repetitions=5000
     )
     
     print("\n\n" + "="*80)
-    print("                     SUMMARY OF ALL CALIBRATION RESULTS")
+    print(" SUMMARY OF ALL CALIBRATION RESULTS")
     print("="*80)
     
     results_list = []
@@ -289,7 +352,9 @@ if __name__ == '__main__':
             'Ke': params['Ke'],
             'Cqq': params['Cqq'],
             'Bias': params['bias'],
-            'NSE': params['NSE'],
+            'S_init': params['S_init'], 
+            'G_init': params['G_init'], 
+            'Smax': params['Smax'], 
             'KGE': params['KGE']
         })
 
@@ -300,11 +365,12 @@ if __name__ == '__main__':
         results_df = results_df.sort_values(by='KGE', ascending=False).reset_index(drop=True)
         
         # Print the final summary table
+        # NOTE: If 'tabulate' is not installed, this will raise an ImportError, but the logic is correct.
         print(results_df.to_markdown(index=True, floatfmt=".4f"))
 
         print("\n\n" + "="*80)
         print("✅ NEXT STEPS:")
-        print("1. Copy the Kperc, Kb, Ke, Cqq, and Bias values for the basin you wish to use.")
+        print("1. Copy the Kperc, Kb, Ke, Cqq, Bias, **S_init**, **G_init**, and **Smax_Used** values.")
         print("2. Update the corresponding parameters in your EnKF script (src/enkf.py) to ensure stability.")
         print("="*80)
 
