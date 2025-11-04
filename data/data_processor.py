@@ -1,236 +1,3 @@
-
-
-# import os
-# import numpy as np
-# import pandas as pd
-# import xarray as xr
-# import geopandas as gpd
-# import rioxarray
-# import requests
-# import io
-# from glob import glob
-# from tqdm import tqdm
-# from shapely.geometry import mapping
-# from rioxarray.exceptions import NoDataInBounds
-# from typing import Tuple, List
-
-# # --- PROJECT SETUP ---
-# # Determine the project root, assuming this file is in 'data/'
-# PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-# # --- GLOBAL PATHS (Updated to use relative paths within the repo) ---
-# NLDAS_DATA_DIR = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'NLDAS_NOAH0125_M_002_1994_2023')
-# BASE_FOLDER_STREAMFLOW = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'usgs_streamflow')
-# NDVI_PATH = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'NDVI', 'MOD13A2_NDVI_monthly_2000_2018_CAMELS.csv')
-
-# # --- CONSTANTS ---
-# TIME_SLICE = slice("2000-01-01", "2014-12-31")
-# N_TOP_BASINS = 670
-# MISSING_DATA_THRESHOLD = 0.05
-# LAMBDA = 2.45e6  # Latent heat of vaporization for water (~20C) in J/kg
-
-# # --- UTILITY FUNCTIONS (Remain UNCHANGED) ---
-
-# def read_streamflow_file(file_path):
-#     try:
-#         df = pd.read_csv(file_path, sep='\s+', header=None, names=['gaugeid', 'year', 'month', 'day', 'streamflow', 'flag'])
-#         df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
-#         df = df[(df['streamflow'] >= 0) & (df['streamflow'] != -999.00)]
-#         return df[['gaugeid', 'date', 'streamflow']]
-#     except Exception:
-#         return None
-
-# def import_streamflow_data(base_folder):
-#     all_data = []
-#     if not os.path.exists(base_folder):
-#         return pd.DataFrame()
-
-#     for folder in range(1, 19):
-#         folder_path = os.path.join(base_folder, f"{folder:02}")
-#         if not os.path.exists(folder_path): continue
-            
-#         file_paths = glob(os.path.join(folder_path, '*_streamflow_qc.txt'))
-#         for file_path in file_paths:
-#             df = read_streamflow_file(file_path)
-#             if df is not None:
-#                 gauge_id = os.path.basename(file_path).split('_')[0]
-#                 df['gaugeid'] = gauge_id
-#                 df['month'] = df['date'].dt.to_period('M')
-#                 # Aggregating daily ft^3/s to monthly mean ft^3/s
-#                 monthly_df = df.groupby(['gaugeid', 'month']).streamflow.mean().reset_index()
-#                 monthly_df = monthly_df.pivot(index='month', columns='gaugeid', values='streamflow')
-#                 all_data.append(monthly_df)
-
-#     if all_data:
-#         streamflow_data_all = pd.concat(all_data, axis=1)
-#         streamflow_data_all = streamflow_data_all.loc[:, ~streamflow_data_all.columns.duplicated()].sort_index()
-#         if 'month' in streamflow_data_all.index.names:
-#             streamflow_data_all.index = streamflow_data_all.index.to_timestamp()
-#     else:
-#         streamflow_data_all = pd.DataFrame()
-#     return streamflow_data_all
-
-# # --- MAIN LOADING FUNCTION (Unit Conversions Implemented) ---
-
-# def load_and_prepare_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, 
-#                                      pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, 
-#                                      pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    
-
-    
-#     print("Loading CAMELS attributes and streamflow...")
-#     # Load CAMELS Attributes (Unchanged)
-#     try:
-#         r = requests.get("https://www.hydroshare.org/resource/658c359b8c83494aac0f58145b1b04e6/data/contents/camels_attributes_v2.0.feather")
-#         attrs = gpd.read_feather(io.BytesIO(r.content)).reset_index(drop=False)
-#         attrs['geometry_points'] = attrs['geometry'].centroid 
-#         attrs = attrs.set_geometry('geometry_points')
-#     except Exception as e:
-#         print(f"FATAL: Error loading CAMELS attributes: {e}")
-#         return (None,) * 10 
-        
-#     # Load USGS Streamflow (Unchanged structure)
-#     streamflow_data_all = import_streamflow_data(BASE_FOLDER_STREAMFLOW)
-#     if streamflow_data_all.empty:
-#         print(f"FATAL: USGS streamflow data loading failed. Check {BASE_FOLDER_STREAMFLOW} and run 'git lfs pull'.")
-#         return (None,) * 10 
-
-#     # --- Streamflow Processing (Unchanged preprocessing) ---
-#     streamflow_data_all = streamflow_data_all.loc['1984-01-01':'2014-12-31']
-#     valid_cols = streamflow_data_all.columns[streamflow_data_all.isna().mean() <= MISSING_DATA_THRESHOLD]
-#     streamflow_data_all = streamflow_data_all[valid_cols]
-#     streamflow_data_all = streamflow_data_all.interpolate(method='linear', axis=0).ffill().bfill()
-    
-#     attrs['gauge_id'] = attrs['gauge_id'].astype(str).str.strip().str.zfill(8)
-#     attrs.set_index('gauge_id', inplace=True)
-#     streamflow_data_all.columns = streamflow_data_all.columns.astype(str).str.strip().str.zfill(8)
-
-#     area_km2_series = attrs['area_gages2'].loc[streamflow_data_all.columns]
-    
-#     # --- FIX 1: Correct USGS Streamflow Conversion (ft^3/s to mm/month) ---
-#     Q_USGS_monthly_full = pd.DataFrame(index=streamflow_data_all.index, columns=streamflow_data_all.columns)
-    
-#     for col in streamflow_data_all.columns:
-#         days_in_month = streamflow_data_all.index.days_in_month.values
-#         area_m2 = area_km2_series.loc[col] * 1e6
-        
-#         # Q_ft3/s * 0.028316846 (m3/ft3) * 86400 (s/day) * Days_in_Month (day/month) * 1000 (mm/m) / Area_m2 (m2) = Q (mm/month)
-#         Q_USGS_monthly_full[col] = (streamflow_data_all[col].values * 0.028316846 * 86400 * days_in_month * 1000) / area_m2
-#     # --- END FIX 1 ---
-
-#     # --- NDVI Loading (Unchanged) ---
-#     print(f"Loading NDVI data from {NDVI_PATH}...")
-#     try:
-#         NDVI_CAMELS_sites = pd.read_csv(NDVI_PATH).set_index('month')
-#     except FileNotFoundError:
-#         print(f"FATAL: NDVI file not found at {NDVI_PATH}. Check path and run 'git lfs pull'.")
-#         return (None,) * 10
-        
-#     NDVI_CAMELS_sites.replace(-9999, np.nan, inplace=True)
-#     cols_to_drop = [col for col in NDVI_CAMELS_sites.columns if NDVI_CAMELS_sites[col].isna().mean() > MISSING_DATA_THRESHOLD]
-#     NDVI_CAMELS_sites.drop(columns=cols_to_drop, inplace=True)
-#     NDVI_CAMELS_sites = NDVI_CAMELS_sites.apply(lambda x: x.fillna(x.mean()), axis=0)
-#     NDVI_CAMELS_sites.index = pd.PeriodIndex(NDVI_CAMELS_sites.index, freq='M').to_timestamp()
-
-#     # --- NLDAS Loading (Unchanged) ---
-#     print(f"Loading NLDAS data from {NLDAS_DATA_DIR}...")
-#     try:
-#         nc_files = glob(NLDAS_DATA_DIR + '/*.nc')
-#         if not nc_files:
-#             raise FileNotFoundError(f"No .nc files found in NLDAS directory: {NLDAS_DATA_DIR}. Run 'git lfs pull'.")
-
-#         FluxData_all = xr.open_mfdataset(nc_files, concat_dim='time', combine='nested', 
-#                                          coords='minimal', compat='override', parallel=True)
-#         FluxData_all = FluxData_all.rio.write_crs("EPSG:4326", inplace=True)
-#     except Exception as e:
-#         print(f"FATAL: Error loading NLDAS netCDF files. Possible LFS issue or corrupt file: {e}")
-#         return (None,) * 10 
-    
-#     # --- Data Filtering and Extraction (Unchanged) ---
-#     common_gauges = list(set(attrs.index) & set(Q_USGS_monthly_full.columns))
-
-#     attrs_large = attrs.loc[common_gauges].sort_values(by="area_gages2", ascending=False).head(N_TOP_BASINS)
-#     BASIN_IDS = attrs_large.index.tolist()
-    
-#     print(f"Extracting NLDAS variables for the top {len(BASIN_IDS)} basins...")
-#     attrs_large = attrs_large.to_crs("EPSG:4326")
-    
-#     vars_to_extract = ["Evap", "Rainf", "Qs", "Qsb", "PotEvap", "Streamflow", "LAI", "RootMoist", "SoilM_0_200cm"]
-#     dfs = {} 
-    
-#     for var_name in vars_to_extract:
-#         var_da = FluxData_all[var_name].sel(time=TIME_SLICE)
-#         data_dict = {}
-#         for basin_id, row in tqdm(attrs_large.iterrows(), total=len(attrs_large), desc=f"NLDAS-{var_name}"):
-#             geom = [mapping(row["geometry"])]
-#             try:
-#                 clipped = var_da.rio.clip(geom, attrs_large.crs, drop=True)
-#                 basin_mean = clipped.mean(dim=["lat", "lon"], skipna=True)
-#                 data_dict[basin_id] = basin_mean.to_pandas()
-#             except NoDataInBounds: continue
-            
-#         df = pd.DataFrame(data_dict, index=var_da.time.values)
-#         dfs[var_name] = df.reindex(BASIN_IDS, axis=1).sort_index()
-
-#     # NLDAS Variables (kg/m2 are already ~mm/month)
-#     Rainf_df = dfs['Rainf'] 
-#     Evap_df = dfs['Evap'] 
-#     Qsb_df = dfs['Qsb'] 
-#     NLDAS_Streamflow_df = dfs['Streamflow'] # m3/s
-#     RootMoist_df = dfs['RootMoist'] # mm
-#     SoilM_0_200cm_df = dfs['SoilM_0_200cm'] # mm
-
-    
-#     # --- FIX 2a: NLDAS PotEvap (PET) Conversion (W/m2 to mm/month) ---
-#     # Convert W/m2 (energy flux) to mm/month (water depth flux)
-#     PotEvap_df_converted = dfs['PotEvap'].copy()
-#     for col in PotEvap_df_converted.columns:
-#         days_in_month = PotEvap_df_converted.index.days_in_month.values
-#         seconds_in_month = days_in_month * 86400
-#         # Calculation: PotEvap (W/m2) * seconds_in_month / (LAMBDA * 1000) = mm/month
-#         PotEvap_df_converted[col] = PotEvap_df_converted[col].values * seconds_in_month / (LAMBDA * 1000)
-    
-#     PotEvap_df = PotEvap_df_converted # Assign the converted DataFrame
-#     # --- END FIX 2a ---
-
-#     Q_USGS_monthly = Q_USGS_monthly_full.loc[TIME_SLICE.start:TIME_SLICE.stop, BASIN_IDS]
-#     NDVI_CAMELS_sites_selected = NDVI_CAMELS_sites.loc[TIME_SLICE.start:TIME_SLICE.stop, BASIN_IDS]
-    
-#     # --- FIX 2b: NLDAS Streamflow Conversion (m3/s to mm/month) ---
-#     Q_nldas_mm_monthly = NLDAS_Streamflow_df.copy()
-#     for basin in NLDAS_Streamflow_df.columns:
-#         area_km2 = attrs_large.loc[basin, 'area_gages2']
-#         area_m2 = area_km2 * 1e6
-#         days_in_month = Q_nldas_mm_monthly.index.days_in_month.values
-        
-#         # Calculation: Q (m3/s) * 86400 * days_in_month * 1000 / area_m2 = Q (mm/month)
-#         Q_nldas_mm_monthly[basin] = (NLDAS_Streamflow_df[basin].values * 86400 * days_in_month * 1000) / area_m2
-#     # --- END FIX 2b ---
-
-#     # Calculate M_df (NDVI index) (Unchanged)
-#     NDVI_normalized = (NDVI_CAMELS_sites_selected - NDVI_CAMELS_sites_selected.min()) / \
-#                       (NDVI_CAMELS_sites_selected.max() - NDVI_CAMELS_sites_selected.min())
-#     NDVI_min = np.min(NDVI_normalized.values)
-#     NDVI_max = np.max(NDVI_normalized.values)
-#     M_df = (NDVI_normalized - NDVI_min) / (NDVI_max - NDVI_min)
-    
-#     # Create Slope_df (Static slope attribute expanded to time series) (Unchanged)
-#     slope_static_series = attrs_large['slope_mean']
-#     Slope_df = pd.DataFrame(index=Rainf_df.index, columns=Rainf_df.columns, dtype=float)
-#     for basin in Rainf_df.columns:
-#         Slope_df[basin] = slope_static_series.loc[basin]
-
-#     # --- FINAL INITIAL STATE EXTRACTION (Unchanged) ---
-#     S_init_df = RootMoist_df.iloc[[0]] 
-#     G_init_df = SoilM_0_200cm_df.iloc[[0]]
-
-#     # --- FINAL RETURN STATEMENT (All units consistent) ---
-#     return (Rainf_df, PotEvap_df, Evap_df, Qsb_df, M_df, 
-#             Slope_df, Q_nldas_mm_monthly, Q_USGS_monthly,
-#             S_init_df, G_init_df, S_init_df) 
-
-
-
 import os
 import io
 import numpy as np
@@ -254,11 +21,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 NLDAS_DATA_DIR = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'NLDAS_NOAH0125_M_002_1994_2023')
 BASE_FOLDER_STREAMFLOW = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'usgs_streamflow')
 NDVI_PATH = os.path.join(PROJECT_ROOT, 'data', 'input_data', 'NDVI', 'MOD13A2_NDVI_monthly_2000_2018_CAMELS.csv')
-EXTRACTED_DATA_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed', 'extracted_nldas_data.feather')
+EXTRACTED_DATA_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed')
 
 # Constants
 TIME_SLICE = slice("2000-01-01", "2014-12-31")
-N_TOP_BASINS = 100
+N_TOP_BASINS = 670
 MISSING_DATA_THRESHOLD = 0.05
 LAMBDA = 2.45e6  # Latent heat of vaporization for water (J/kg)
 
@@ -393,14 +160,27 @@ def extract_or_load_nldas_data(
     dfs['Q_nldas_mm_monthly'] = Q_nldas_mm_monthly
 
     # Cache combined results
-    combined_dfs = {
-        var: df.rename(columns=lambda c: f"{var}_{c}")
-        for var, df in dfs.items() if var in VARS_TO_CACHE
-    }
-    final_df = pd.concat(combined_dfs.values(), axis=1)
-    os.makedirs(os.path.dirname(EXTRACTED_DATA_PATH), exist_ok=True)
-    final_df.reset_index(names=['time']).to_feather(EXTRACTED_DATA_PATH)
-    print(f"✅ Cached to {EXTRACTED_DATA_PATH}")
+    # combined_dfs = {
+    #     var: df.rename(columns=lambda c: f"{var}_{c}")
+    #     for var, df in dfs.items() if var in VARS_TO_CACHE
+    # }
+    # final_df = pd.concat(combined_dfs.values(), axis=1)
+    # os.makedirs(os.path.dirname(EXTRACTED_DATA_PATH), exist_ok=True)
+    # final_df.reset_index(names=['time']).to_feather(EXTRACTED_DATA_PATH)
+    # print(f"✅ Cached to {EXTRACTED_DATA_PATH}")
+
+    # Save each variable as separate feather
+    CACHE_DIR = r"C:\Users\hdagne1\Box\Dr.Mesfin Research\Codes\DA\DA_Github_repo\Bayesian_DA_Budyko_modeling\data\processed"
+    # CACHE_DIR = os.path.join(os.path.dirname(EXTRACTED_DATA_PATH), "extracted_variables_feather")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    for var_name, df in dfs.items():
+        if var_name not in VARS_TO_CACHE:
+            continue
+        cache_path = os.path.join(CACHE_DIR, f"{var_name}.feather")
+        df.reset_index(names=['time']).to_feather(cache_path)
+        print(f"✅ Saved {var_name} to {cache_path}")
+
 
     return (
         dfs["Rainf"], dfs["PotEvap"], dfs["Evap"], dfs["Qsb"],
@@ -448,6 +228,10 @@ def load_and_prepare_data() -> Tuple[pd.DataFrame, ...]:
         days = streamflow_data.index.days_in_month.values
         area_m2 = area_km2.loc[col] * 1e6
         Q_USGS[col] = streamflow_data[col].values * 0.028316846 * 86400 * days * 1000 / area_m2
+        CACHE_DIR = r"C:\Users\hdagne1\Box\Dr.Mesfin Research\Codes\DA\DA_Github_repo\Bayesian_DA_Budyko_modeling\data\processed"
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        q_usgs_path = os.path.join(CACHE_DIR, "Q_USGS.feather")
+        Q_USGS.reset_index(names=['time']).to_feather(q_usgs_path)
 
     # NDVI
     print(f"Loading NDVI data from {NDVI_PATH}...")
