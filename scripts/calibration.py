@@ -8,14 +8,12 @@ from typing import Dict, Any, Tuple, Optional
 from multiprocessing import cpu_count, get_context
 import warnings
 import spotpy
-
 from src.model import ModelParams, two_store_model_step
 from src.metrics import calculate_kge
-
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in true_divide')
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 S_MAX_CEILING = 2500.0
 G_MAX_CEILING = S_MAX_CEILING * 3.0
 REPS = 5000
