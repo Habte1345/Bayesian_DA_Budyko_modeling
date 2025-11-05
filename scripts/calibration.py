@@ -16,10 +16,10 @@ warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid valu
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 S_MAX_CEILING = 2500.0
 G_MAX_CEILING = S_MAX_CEILING * 3.0
-REPS = 5000
-Smax_heu = 0.05
-S_init = 0.35
-G_init = 0.15
+REPS = 2000
+Smax_heu = 10
+S_init = 100
+G_init = 50
 
 
 def run_forward_model(P_data, PET_data, Q_obs, initial_state: tuple, params: ModelParams) -> tuple:
