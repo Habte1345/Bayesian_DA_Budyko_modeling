@@ -55,8 +55,8 @@ Q_nldas_df = load_feather_df("Q_nldas_mm_monthly.feather", DATA_DIR)
 Qsb_df = load_feather_df("Qsb.feather", DATA_DIR)
 M_df = load_feather_df("M.feather", DATA_DIR)
 Slope_basin = load_feather_df("slope.feather", DATA_DIR)
-S_init_df = load_feather_df("RootMoist.feather", DATA_DIR)
-G_init_df = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
+# S_init_df = load_feather_df("RootMoist.feather", DATA_DIR)
+# G_init_df = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
 
 M_basin = M_df[Slope_basin.columns]
 M_basin.index = pd.to_datetime(M_basin.index, format='%Y-%m')
@@ -86,8 +86,8 @@ def simulate_basin(basin_id):
     Qsb = Qsb_df[[basin_id]]
     M = M_basin[[basin_id]]
     Slope = Slope_basin[[basin_id]]
-    S_init = S_init_df[basin_id].iloc[0]
-    G_init = G_init_df[basin_id].iloc[0]
+    S_init = 5.0
+    G_init = 2.5
 
     model_params = ModelParams(Smax=p['Smax'], Kperc=p['Kperc'], Kb=p['Kb'], Ke=p['Ke'], Cqq=p['Cqq'])
 
