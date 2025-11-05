@@ -1,281 +1,150 @@
-# # src/budyko.py
-
-# import numpy as np
-# from dataclasses import dataclass
-# from scipy.optimize import fsolve
-
-# # =====================================================================
-# # 1. BUDYKO FRAMEWORK - Fu's Equation 
-# # =====================================================================
-
-# def fu_budyko(phi: np.ndarray, omega: np.ndarray) -> np.ndarray:
-#     """Calculates the ET/P ratio based on Fu's Budyko equation."""
-#     # Ensure numerical stability
-#     phi_safe = np.maximum(phi, 1e-6)
-#     om_safe = np.maximum(omega, 1.0)
-    
-#     with np.errstate(all='ignore'):
-#         # Fu's equation: E/P = 1 + phi - (1 + phi^omega)^(1/omega)
-#         term = np.power(1.0 + np.power(phi_safe, om_safe), 1.0 / om_safe)
-#         result = 1.0 + phi_safe - term
-        
-#     return np.clip(result, 1e-6, 1.0) # ET/P ratio must be between 0 and 1
-
-
-# def solve_omega_true(P, PET, ET_obs, Qb_obs):
-#     """
-#     Numerically solves for the Budyko parameter (omega) for a catchment.
-    
-#     Inputs are typically long-term means or annual values, but applied here 
-#     to monthly time series, which is a common practice in DA-based omega estimation.
-#     """
-#     valid_P = P > 1e-6
-#     valid_ET_obs = ET_obs > 1e-6
-#     valid_idx = valid_P & valid_ET_obs
-#     omega_true = np.full_like(P, np.nan, dtype=float)
-
-#     P_valid = P[valid_idx]
-#     PET_valid = PET[valid_idx]
-#     ET_obs_valid = ET_obs[valid_idx]
-#     Qb_obs_valid = Qb_obs[valid_idx]
-    
-#     # Calculate the effective P (P - dS/dt, approximated by P - dS/dt = ET + Q)
-#     # Since we are solving for a steady-state approximation, we use 
-#     # P_eff = ET + Q_total = ET_obs + (Qs_obs + Qb_obs) 
-#     # NOTE: The original code used P_minus_dS = ET_ke + Qb. We must ensure P_eff > 0.
-#     P_eff_valid = np.maximum(P_valid, 1e-6) # Use P as the primary driver for aridity index
-    
-#     # Aridity index: phi = PET / P_eff
-#     phi_valid = PET_valid / P_eff_valid
-    
-#     # Evaporative ratio: E_ratio = ET / P_eff
-#     et_ratio_valid = np.clip(ET_obs_valid / P_eff_valid, 1e-6, 0.999)
-
-#     for i in range(len(P_valid)):
-#         phi = phi_valid[i]
-#         et_ratio = et_ratio_valid[i]
-        
-#         # The objective function is f(omega) = Fu(phi, omega) - et_ratio = 0
-#         def objective_func(omega):
-#             if omega < 1.0: return 1e10 # Constraint: omega >= 1.0
-#             try:
-#                 # Fu's equation (simplified for scalar)
-#                 f_val = 1.0 + phi - np.power(1.0 + np.power(phi, omega), 1.0/omega)
-#                 return (f_val - et_ratio)
-#             except: 
-#                 return 1e10
-        
-#         try:
-#             # Solve for omega, starting near the typical range
-#             omega_solution, infodict, ier, msg = fsolve(objective_func, x0=2.5, full_output=True, xtol=1e-4)
-#             if ier == 1:
-#                 omega = omega_solution[0]
-#                 omega_true[np.where(valid_idx)[0][i]] = np.clip(omega, 1.0, 10.0) # Clip to realistic range
-#         except:
-#             pass
-
-#     return omega_true
-
-
-# # =====================================================================
-# # 2. OMEGA MLR MODEL - Dynamic Catchment Characteristics
-# # =====================================================================
-
-# @dataclass
-# class OmegaMLRModel:
-#     """Dataclass for storing Multiple Linear Regression coefficients for omega."""
-#     beta0: float
-#     beta1: float
-#     beta2: float
-    
-#     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
-#         """Predicts omega based on vegetation cover (M) and Slope."""
-#         omega_pred = self.beta0 + self.beta1 * M + self.beta2 * Slope
-#         return np.clip(omega_pred, 1.0, 10.0) # Ensure Omega is within realistic bounds
-
-
-# def fit_omega_mlr(M: np.ndarray, Slope: np.ndarray, omega_true: np.ndarray) -> OmegaMLRModel:
-#     """Fits an MLR model (omega ~ beta0 + beta1*M + beta2*Slope) to omega_true."""
-#     valid_idx = ~(np.isnan(M) | np.isnan(Slope) | np.isnan(omega_true))
-    
-#     if valid_idx.sum() < 3:
-#         # Fallback to default coefficients if not enough data
-#         return OmegaMLRModel(beta0=2.36, beta1=1.16, beta2=0.0)
-    
-#     M_valid = M[valid_idx]
-#     # NOTE: Assuming Slope is static, we still create a vector of the static value
-#     Slope_valid = Slope[valid_idx] 
-#     omega_valid = omega_true[valid_idx]
-    
-#     # Construct the design matrix X for MLR: [Ones, M, Slope]
-#     X = np.vstack([np.ones_like(M_valid), M_valid, Slope_valid]).T
-    
-#     try:
-#         coef, _, _, _ = np.linalg.lstsq(X, omega_valid, rcond=None)
-        
-#         if np.any(np.isnan(coef)) or len(coef) < 3:
-#             # Fallback to simple M-only regression (omitting Slope)
-#             X_M = np.vstack([np.ones_like(M_valid), M_valid]).T
-#             coef_M, _, _, _ = np.linalg.lstsq(X_M, omega_valid, rcond=None)
-#             return OmegaMLRModel(beta0=coef_M[0], beta1=coef_M[1], beta2=0.0)
-            
-#         return OmegaMLRModel(beta0=coef[0], beta1=coef[1], beta2=coef[2])
-#     except np.linalg.LinAlgError:
-#         # Fallback if the matrix is singular
-#         return OmegaMLRModel(beta0=2.36, beta1=1.16, beta2=0.0)
-    
-
-# # =====================================================================
-# # 3. HELPER FUNCTION: ESTIMATE BUDYKO ET FOR SCENARIOS
-# # =====================================================================
-
-# def estimate_budyko_et(P, PET, model='Fu', m=1.35):
-#     """
-#     Estimate ET using Fu Budyko model with adjusted m (a helper function 
-#     used in run_simulation.py for scenario definition).
-#     """
-#     # Use Fu's equation with a static omega=m, and assume omega=m is applied to Aridity Index (PET/P)
-#     if P <= 0 or PET <= 0:
-#         return 0.0
-    
-#     aridity = PET / P
-    
-#     # Fu's equation for E/P (where m acts as omega)
-#     # E/P = 1 + phi - (1 + phi^omega)^(1/omega)
-#     try:
-#         E_P_ratio = 1.0 + aridity - (1.0 + aridity ** m) ** (1.0 / m)
-#         ET = P * E_P_ratio
-#     except Exception:
-#         # Fallback for numerical instability
-#         ET = 0.0 
-        
-#     return np.clip(ET, 0.0, min(PET, P * 0.999)) # ET cannot exceed P or PET
-
-
-
 # src/budyko.py
-
 import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from scipy.optimize import fsolve
+import warnings
 
-# =====================================================================
-# 1. BUDYKO FRAMEWORK - Fu's Equation 
-# =====================================================================
-
-def fu_budyko(phi: np.ndarray, omega: np.ndarray) -> np.ndarray:
-    """Calculates the ET/P ratio based on Fu's Budyko equation."""
-    phi_safe = np.maximum(phi, 1e-6)
-    om_safe = np.maximum(omega, 1.0)
-    
-    with np.errstate(all='ignore'):
-        term = np.power(1.0 + np.power(phi_safe, om_safe), 1.0 / om_safe)
-        result = 1.0 + phi_safe - term
-        
-    return np.clip(result, 1e-6, 1.0)
-
-
-def solve_omega_true(P, PET, ET_obs, Qb_obs):
-    """Numerically solves for the Budyko parameter (omega) for each catchment."""
-    valid_P = P > 1e-6
-    valid_ET_obs = ET_obs > 1e-6
-    valid_idx = valid_P & valid_ET_obs
-    omega_true = np.full_like(P, np.nan, dtype=float)
-
-    P_valid = P[valid_idx]
-    PET_valid = PET[valid_idx]
-    ET_obs_valid = ET_obs[valid_idx]
-    Qb_obs_valid = Qb_obs[valid_idx]
-
-    P_eff_valid = np.maximum(P_valid, 1e-6)
-    phi_valid = PET_valid / P_eff_valid
-    et_ratio_valid = np.clip(ET_obs_valid / P_eff_valid, 1e-6, 0.999)
-
-    for i in range(len(P_valid)):
-        phi = phi_valid[i]
-        et_ratio = et_ratio_valid[i]
-
-        def objective_func(omega):
-            if omega < 1.0:
-                return 1e10
-            try:
-                f_val = 1.0 + phi - np.power(1.0 + np.power(phi, omega), 1.0 / omega)
-                return f_val - et_ratio
-            except:
-                return 1e10
-
-        try:
-            omega_solution, _, ier, _ = fsolve(objective_func, x0=2.5, full_output=True, xtol=1e-4)
-            if ier == 1:
-                omega = omega_solution[0]
-                omega_true[np.where(valid_idx)[0][i]] = np.clip(omega, 1.0, 10.0)
-        except:
-            pass
-
-    return omega_true
-
-
-# =====================================================================
-# 2. OMEGA MLR MODEL - Dynamic Catchment Characteristics
-# =====================================================================
+# Suppress runtime warnings that often occur with complex numerical operations
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 @dataclass
 class OmegaMLRModel:
-    """Dataclass for storing Multiple Linear Regression coefficients for omega."""
     beta0: float
     beta1: float
     beta2: float
 
     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
-        """Predicts omega based on vegetation cover (M) and Slope."""
         omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
         return np.clip(omega_MLR, 1.0, 10.0)
 
+class BudykoModelEstimator:
+    def __init__(self, Evap_df: pd.DataFrame, Qsb_monthly: pd.DataFrame, 
+                 PotEvap_df: pd.DataFrame, M_basin: pd.DataFrame, 
+                 Slope_basin: pd.DataFrame, ke: float = 0.68):
+        self.Evap_df = Evap_df
+        self.Qsb_monthly = Qsb_monthly
+        self.PotEvap_df = PotEvap_df
+        self.M_basin = M_basin
+        self.Slope_basin = Slope_basin
+        self.ke = ke
 
-def fit_omega_mlr(M: np.ndarray, Slope: np.ndarray, omega_true: np.ndarray) -> OmegaMLRModel:
-    """Fits an MLR model (omega ~ beta0 + beta1*M + beta2*Slope) to omega_true."""
-    valid_idx = ~(np.isnan(M) | np.isnan(Slope) | np.isnan(omega_true))
-    if valid_idx.sum() < 3:
-        return OmegaMLRModel(beta0=2.36, beta1=1.16, beta2=0.0)
+        self.omega_true = None
+        self.omega_MLR = None
+        self.ET_B = None
 
-    M_valid = M[valid_idx]
-    Slope_valid = Slope[valid_idx]
-    omega_valid = omega_true[valid_idx]
+    def _solve_for_omega(self, ET, QB, PET, omega_guess=1.0):
+        if (ET + QB) == 0:
+            return np.nan
+        ratio_ET = ET / (ET + QB)
+        ratio_PET = PET / (ET + QB)
+        def f(omega):
+            return 1 + ratio_PET - (1 + ratio_PET**omega)**(1/omega) - ratio_ET
+        try:
+            sol = fsolve(f, x0=omega_guess, xtol=1e-8)
+            return sol[0] if np.isfinite(sol[0]) else np.nan
+        except:
+            return np.nan
 
-    X = np.vstack([np.ones_like(M_valid), M_valid, Slope_valid]).T
+    def compute_omega_true(self) -> pd.DataFrame:
+        # print("  🔸 Budyko omega_true estimation...")
+        Evap_df = self.Evap_df
+        Qsb_monthly = self.Qsb_monthly
+        PotEvap_df = self.PotEvap_df
+        ke = self.ke
+        omega_true = pd.DataFrame(index=Evap_df.index, columns=Evap_df.columns, dtype=float)
 
-    try:
-        coef, _, _, _ = np.linalg.lstsq(X, omega_valid, rcond=None)
-        if np.any(np.isnan(coef)) or len(coef) < 3:
-            X_M = np.vstack([np.ones_like(M_valid), M_valid]).T
-            coef_M, _, _, _ = np.linalg.lstsq(X_M, omega_valid, rcond=None)
-            return OmegaMLRModel(beta0=coef_M[0], beta1=coef_M[1], beta2=0.0)
-        return OmegaMLRModel(beta0=coef[0], beta1=coef[1], beta2=coef[2])
-    except np.linalg.LinAlgError:
-        return OmegaMLRModel(beta0=2.36, beta1=1.16, beta2=0.0)
+        for col in PotEvap_df.columns:
+            QB_col = Qsb_monthly[col].values
+            PET_col = PotEvap_df[col].values
+            ET_Ke = ke * PET_col
+            omega_values = np.array([
+                self._solve_for_omega(ET, QB, PET)
+                for ET, QB, PET in zip(ET_Ke, QB_col, PET_col)
+            ])
+            omega_true[col] = omega_values
 
+        self.omega_true = omega_true
+        return self.omega_true
 
-# =====================================================================
-# 3. HELPER FUNCTION: ESTIMATE BUDYKO ET USING DYNAMIC OMEGA_MLR
-# =====================================================================
+    def fit_and_compute_omega_mlr(self) -> pd.DataFrame:
+        # print("  🔸 Budyko omega_mlr fitting...")
+        if self.omega_true is None:
+            self.compute_omega_true()
 
-def estimate_budyko_et(P, PET, M, Slope, omega_model: OmegaMLRModel, model='Fu'):
-    """
-    Estimate ET using Fu Budyko model with dynamic omega predicted 
-    from MLR model (depends on vegetation M and slope).
-    """
-    if P <= 0 or PET <= 0:
-        return 0.0
+        M = self.M_basin.values
+        Slope = self.Slope_basin.values
+        omega_true = self.omega_true.values
 
-    aridity = PET / P
+        if Slope.ndim == 2 and Slope.shape[0] == 1:
+            Slope_flat = Slope.flatten()
+        elif Slope.ndim == 1:
+            Slope_flat = Slope
+        else:
+            raise ValueError(f"Slope shape not recognized: {Slope.shape}")
 
-    # Predict dynamic omega_MLR based on current M and Slope
-    omega_MLR = omega_model.predict(np.array([M]), np.array([Slope]))[0]
+        n_time, n_basins = M.shape
+        omega_fitted = np.full_like(M, np.nan, dtype=float)
 
-    try:
-        E_P_ratio = 1.0 + aridity - (1.0 + aridity ** omega_MLR) ** (1.0 / omega_MLR)
-        ET_B = P * E_P_ratio
-    except Exception:
-        ET_B = 0.0
+        for i in range(n_basins):
+            M_col = M[:, i]
+            Slope_val = Slope_flat[i]
+            Slope_col = np.full(n_time, Slope_val)
+            valid_idx = ~(np.isnan(M_col) | np.isnan(Slope_col) | np.isnan(omega_true[:, i]))
 
-    return np.clip(ET_B, 0.0, min(PET, P * 0.999))  # ET cannot exceed P or PET
+            if valid_idx.sum() < 3:
+                omega_fitted[:, i] = 2.36 + 1.16 * M_col
+                continue
+
+            X = np.vstack([np.ones(valid_idx.sum()), M_col[valid_idx], Slope_col[valid_idx]]).T
+            y = omega_true[valid_idx, i]
+
+            try:
+                coef, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+                if len(coef) < 3 or np.any(np.isnan(coef)):
+                    X_M = np.vstack([np.ones(valid_idx.sum()), M_col[valid_idx]]).T
+                    coef_M, _, _, _ = np.linalg.lstsq(X_M, y, rcond=None)
+                    omega_fitted[:, i] = coef_M[0] + coef_M[1] * M_col
+                else:
+                    omega_fitted[:, i] = coef[0] + coef[1] * M_col + coef[2] * Slope_col
+            except np.linalg.LinAlgError:
+                omega_fitted[:, i] = 2.36 + 1.16 * M_col
+
+        omega_fitted_clipped = np.clip(omega_fitted, 1.0, 10.0)
+        self.omega_MLR = pd.DataFrame(omega_fitted_clipped,
+                                      index=self.M_basin.index,
+                                      columns=self.M_basin.columns)
+        return self.omega_MLR
+
+    def estimate_budyko_et(self) -> pd.DataFrame:
+        # print("  🔸 Budyko ET_B estimation...")
+        if self.omega_MLR is None:
+            self.fit_and_compute_omega_mlr()
+
+        Qb = self.Qsb_monthly
+        PET_df = self.PotEvap_df
+        omega_MLR = self.omega_MLR
+        P_values = (self.Evap_df + Qb).values
+        PET_values = PET_df.values
+        aridity = np.divide(PET_values, P_values, out=np.zeros_like(PET_values), where=P_values > 0)
+
+        with np.errstate(over='ignore', invalid='ignore'):
+            omega_values = omega_MLR.values
+            E_ratio = 1.0 + aridity - np.power(1.0 + np.power(aridity, omega_values), 1.0 / omega_values)
+
+        E_ratio = np.nan_to_num(E_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+        ET_est = P_values * E_ratio
+        ET_est = np.clip(ET_est, 0.0, np.minimum(PET_values, P_values))
+        self.ET_B = pd.DataFrame(ET_est, index=PET_df.index, columns=PET_df.columns)
+        return self.ET_B
+
+    def OmegaTrue_OmegaMLR_BudykoET(self) -> pd.DataFrame:
+        print("Starting Budyko Model Estimation Workflow...")
+        self.compute_omega_true()
+        self.fit_and_compute_omega_mlr()
+        self.estimate_budyko_et()
+        print("Workflow complete.")
+        return self.ET_B
+
+if __name__ == '__main__':
+    print("BudykoModelEstimator class defined. Run a separate script to execute the full workflow.")
