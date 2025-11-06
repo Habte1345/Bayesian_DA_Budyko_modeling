@@ -298,3 +298,25 @@ if __name__ == '__main__':
             
     except Exception as e:
         print(f"❌ An unexpected error occurred during data processing: {e}")
+
+
+
+########### --- National Water Model Data ------------------------------------
+# import pandas as pd
+# import os
+# from glob import glob
+
+# data_dir = r"E:\Data\NWM"
+# csv_files = glob(os.path.join(data_dir, "*.csv"))
+
+# dfs = []
+
+# for file in csv_files:
+#     usgs_id = os.path.splitext(os.path.basename(file))[0]  # e.g. "1333000"
+#     df = pd.read_csv(file, sep=',', parse_dates=['time'])
+#     df = df.rename(columns={df.columns[1]: usgs_id})
+#     dfs.append(df.set_index('time'))
+# combined_df = pd.concat(dfs, axis=1)
+# combined_df = combined_df.loc['2000-01-01':'2014-12-31']
+# monthly_df = combined_df.resample('M').mean()
+# monthly_df.to_feather(r'C:\Users\hdagne1\Box\Dr.Mesfin Research\Codes\DA\DA_Github_repo\Bayesian_DA_Budyko_modeling\data\processed\NMW.feather')
