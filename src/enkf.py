@@ -1,3 +1,4 @@
+
 # src/enkf.py (No Hardcoded Constraints)
 from dataclasses import dataclass, field
 import numpy as np
@@ -11,15 +12,15 @@ from .model import ModelParams, two_store_model_step
 
 @dataclass
 class EnKFConfig:
-    nens: int = 300
+    nens: int = 5
     # [S, G, Kperc, Kb, Ke, Cqq] - keep 6D for compatibility with initial ensemble setup
     state_dim: int = 6
     # Random-walk SD (not used when parameters are fixed, but kept for compatibility)
     param_rw_sd: np.ndarray = field(
         default_factory=lambda: np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     )
-    R_Q: float = 100.0   # Observation error covariance for Q (if used)
-    R_ET: float = 50.0   # Observation error covariance for ET
+    R_Q: float = 100   # Observation error covariance for Q (if used)
+    R_ET: float = 20   # Observation error covariance for ET
     inflation: float = 1.05
 
 
@@ -77,9 +78,7 @@ def enkf_forecast_step(
     ET_ens = np.zeros(nens)
 
     Smax_cal = params_cal.Smax
-    # NOTE: Gmax_cal factor (3.0) is a structural constant of the two-store model, 
-    # so it remains here or should be passed as a factor if variable.
-    Gmax_cal = Smax_cal * 3.0 
+    Gmax_cal = Smax_cal * 3
 
     for i in range(nens):
         # 1) Extract only the states

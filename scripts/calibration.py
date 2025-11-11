@@ -22,11 +22,11 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 # Repetition strategy: quick pass, then deeper only for hard basins
 
-REPS_FAST = 1000         # was 400
-REPS_SLOW = 20000        # was 1200
+REPS_FAST = 2000         # was 400
+REPS_SLOW = 5000        # was 1200
 
 # Parameter bounds
-Smax_min, Smax_max = 0.02, 10      # was 0.05–25.0
+Smax_min, Smax_max = 0.02, 100      # was 0.05–25.0
 fS0_min,  fS0_max  = 0.02, 0.99      # was 0.00–0.95
 fG0_min,  fG0_max  = 0.00, 0.99      # was 0.00–0.95
 Gmaxfac_min, Gmaxfac_max = 1.0, 10.0 # was 1.0–6.0
@@ -186,8 +186,8 @@ def worker_calibrate_basin(
         if res is None:
             return target_basin, None
 
-        like = float(res['like1'][best_idx][0])   # objective is -KGE
-        need_more = like > -0.60                  # was -0.50 (i.e., re-run if KGE < 0.60)
+        like = float(res['like1'][best_idx][0])  
+        need_more = like > -0.60                 
 
 
         # Slow pass for hard basins
