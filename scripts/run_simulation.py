@@ -120,7 +120,7 @@ def simulate_basin(basin_id):
     ET_B = ET_B_all[basin_id].values
 
     # --- Parameter setup (auto-adaptive) ---
-    Smax_cal = p.get("Smax", 10.0)
+    Smax_cal = p.get("Smax", 50.0)
     Gmax_factor = p.get("Gmax_factor", 4.0)
     Gmax_cal = Smax_cal * Gmax_factor
     S_init = p.get("S_init", 0.5 * Smax_cal)
