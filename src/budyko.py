@@ -364,7 +364,7 @@ class BudykoModelEstimator:
             # --- CRITICAL CHANGE: Bound omega_true to [0.0, 10.0] ---
             omega_val = sol[0] if np.isfinite(sol[0]) else np.nan
             # Apply the requested bounds to omega_true
-            return np.clip(omega_val, 0.0, 500.0) if np.isfinite(omega_val) else np.nan
+            return np.clip(omega_val, 0.0, 10.0) if np.isfinite(omega_val) else np.nan
             # --------------------------------------------------------
             
         except:
