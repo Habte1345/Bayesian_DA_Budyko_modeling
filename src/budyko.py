@@ -334,7 +334,7 @@ class OmegaMLRModel:
 
     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
         omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
-        return np.clip(omega_MLR, 1.0, 10.0)
+        return np.clip(omega_MLR, 1.0, 5.0)
 
 class BudykoModelEstimator:
     def __init__(self, Evap_df: pd.DataFrame, Qsb_monthly: pd.DataFrame, 
@@ -364,7 +364,7 @@ class BudykoModelEstimator:
             # --- CRITICAL CHANGE: Bound omega_true to [0.0, 10.0] ---
             omega_val = sol[0] if np.isfinite(sol[0]) else np.nan
             # Apply the requested bounds to omega_true
-            return np.clip(omega_val, 0.0, 10.0) if np.isfinite(omega_val) else np.nan
+            return np.clip(omega_val, 0.0, 500.0) if np.isfinite(omega_val) else np.nan
             # --------------------------------------------------------
             
         except:
@@ -391,7 +391,7 @@ class BudykoModelEstimator:
             PET_col = PotEvap_df[col].values
             
             # Use the basin-specific ke_basin to calculate ET_Ke
-            ET_Ke = ke_basin * PET_col 
+            ET_Ke = ke_basin * PET_col  #ke_basin 
             
             omega_values = np.array([
                 self._solve_for_omega(ET, QB, PET)
