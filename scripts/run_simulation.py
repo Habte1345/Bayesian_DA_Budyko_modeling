@@ -206,8 +206,8 @@ def simulate_basin(basin_id):
         return np.asarray(Q_out), np.asarray(S_out), np.asarray(G_out)
 
     # --- Run scenarios ---
-    Q_ke, S_ke, G_ke = run_model(ET_B)
-    Q_b, S_b, G_b = run_model(ET_override=ET_ke)
+    Q_ke, S_ke, G_ke = run_model(ET_ke)
+    Q_b, S_b, G_b = run_model(ET_override=ET_B)
     Q_B_ass, S_B_ass, G_B_ass = run_model(ET_override=ET_B_NLDAS_ass)
 
     # -----------------------------------------------------
@@ -312,11 +312,3 @@ if __name__ == "__main__":
     )
 
     print("\n✅ All basin simulations completed and results saved.")
-
-
-
-
-
-
-
-
