@@ -1,0 +1,23 @@
+scenario: all   # all | base | budyko | budyko_da
+
+paths:
+  data_dir: data/processed
+  result_dir: Simulation_results
+  calibrated_params: SCE_cal_params/final_calibrated_params.json
+
+da:
+  enabled: true                 
+  nens: 1000
+  inflation: 1.08
+  R_ET_std: 20.0
+  proc_S_std: 0.3
+  proc_G_std: 0.7
+  P_std_frac: 0.10
+  PET_std_frac: 0.03
+
+parallel:
+  enabled: true
+  max_workers: -1               # -1 means cpu_count()-1
+
+basins:
+  subset: null                  # null means run all; or list like ["camels_01022500"]

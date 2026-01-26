@@ -1,20 +1,34 @@
-from dataclasses import dataclass, field
+# src/model.py
+from dataclasses import dataclass
 import numpy as np
+
 
 # ---------------------------------------------------------
 # Model Parameters Dataclass
 # ---------------------------------------------------------
-@dataclass(frozen=True)  # immutable parameter set
+@dataclass(frozen=True)
 class ModelParams:
+    Smax: float
+    Kperc: float
+    Kb: float
+    Ke: float
+    Cqq: float
+
+    # NEW (soil-moisture stress parameters)
+    Sfc_frac: float = 0.30   # field capacity fraction of Smax
+    beta_et: float = 2.0     # nonlinearity for ET stress
+
+
+# ---------------------------------------------------------
+# Soil moisture stress function
+# ---------------------------------------------------------
+def soil_moisture_stress(S: float, Smax: float, Sfc_frac: float, beta: float) -> float:
     """
-    Dataclass for storing hydrologic model parameters.
-    Parameters are required, ensuring calibrated values are used.
+    Stress in [0,1]. ET increases with S.
     """
-    Smax: float     # Max soil storage (mm)
-    Kperc: float    # Percolation rate (fraction per timestep)
-    Kb: float       # Baseflow recession constant
-    Ke: float       # Evaporation coefficient (fraction of PET)
-    Cqq: float      # Quickflow coefficient
+    Sfc = max(Sfc_frac * Smax, 1e-6)
+    x = np.clip(S / Sfc, 0.0, 1.0)
+    return float(x ** beta)
 
 
 # ---------------------------------------------------------
@@ -23,23 +37,12 @@ class ModelParams:
 def two_store_model_step(
     S_curr, G_curr, P_t, PET_t, params: ModelParams, ET_override=None
 ):
-    """
-    Executes a single timestep of the two-store hydrologic model.
-
-    Returns:
-        S_next  : updated soil storage
-        G_next  : updated groundwater storage
-        ET_t    : actual evapotranspiration
-        Q_t     : total streamflow (Q_s + Q_b)
-        Qs_t    : quickflow (saturation-excess runoff)
-        Qb_t    : baseflow
-        Perc_t  : percolation to groundwater
-    """
-
     # -----------------------------------------------------
     # 1. Precipitation added to soil store
     # -----------------------------------------------------
-    P_t = max(P_t, 0.0)
+    P_t = max(float(P_t), 0.0)
+    PET_t = max(float(PET_t), 0.0)
+
     S_curr += P_t
 
     # -----------------------------------------------------
@@ -52,11 +55,28 @@ def two_store_model_step(
     S_curr = max(S_curr, 0.0)
 
     # -----------------------------------------------------
-    # 3. Evapotranspiration loss
+    # 3. Evapotranspiration loss (STATE-DEPENDENT)
     # -----------------------------------------------------
-    ET_pot = ET_override if ET_override is not None else params.Ke * PET_t
-    ET_pot = max(ET_pot, 0.0)
-    ET_t = min(ET_pot, S_curr)
+    if ET_override is not None:
+        ET_pot = max(float(ET_override), 0.0)
+        ET_t = min(ET_pot, S_curr)
+    else:
+        # Potential ET
+        ET_pot = max(params.Ke * PET_t, 0.0)
+
+        # NEW: moisture stress depends on S
+        stress = soil_moisture_stress(
+            S=S_curr,
+            Smax=params.Smax,
+            Sfc_frac=params.Sfc_frac,
+            beta=params.beta_et,
+        )
+
+        ET_act = ET_pot * stress
+
+        # water availability
+        ET_t = min(ET_act, S_curr)
+
     S_curr -= ET_t
     S_curr = max(S_curr, 0.0)
 
@@ -78,7 +98,7 @@ def two_store_model_step(
     G_curr = max(G_curr, 0.0)
 
     # -----------------------------------------------------
-    # 6. Total streamflow for this timestep
+    # 6. Total streamflow
     # -----------------------------------------------------
     Q_t = Qs_t + Qb_t
 
