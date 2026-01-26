@@ -10,10 +10,10 @@ da:
   nens: 1000
   inflation: 1.08
   R_ET_std: 20.0
-  proc_S_std: 0.3
+  proc_S_std: 0.3            # process/state noise for S
   proc_G_std: 0.7
-  P_std_frac: 0.10
-  PET_std_frac: 0.03
+  P_std_frac: 0.10          # precipitation perturbation (fraction of P)
+  PET_std_frac: 0.03        # PET perturbation (fraction of PET)
 
 parallel:
   enabled: true
@@ -21,3 +21,9 @@ parallel:
 
 basins:
   subset: null                  # null means run all; or list like ["camels_01022500"]
+
+
+# P_std_frac: 0.10 → precipitation perturbation (fraction of P)
+# PET_std_frac: 0.03 → PET perturbation (fraction of PET)
+# proc_S_std: 0.3 → process/state noise for S
+# proc_G_std: 0.7 → process/state noise for G
