@@ -172,10 +172,10 @@ def run_budyko_da(
     enkf_hist = {
         "time": np.arange(L),
         "nens": nens,
-        "S_ens_hist": S_ens_hist,
-        "G_ens_hist": G_ens_hist,
-        "ET_ens_hist": ET_ens_hist,
-        "Q_ens_hist": Q_ens_hist,
+        "S_ens": S_ens_hist,
+        "G_ens": G_ens_hist,
+        "ET_ens": ET_ens_hist,
+        "Q_ens": Q_ens_hist,
     }
 
     return ET_ass_mean, Q_ass_mean, enkf_hist
@@ -250,6 +250,8 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
     P = Rainf_df.get(basin_id, pd.Series(index=idx)).values
     Q_obs = Q_usgs_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
     Q_nldas = Q_nldas_df.get(basin_id, pd.Series(index=idx)).values
+    Qsb = Qsb_df.get(basin_id, pd.Series(index=idx)).values
+
     ET_nldas = Evap_df[basin_id].values
 
     # Budyko ET
@@ -265,8 +267,20 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
         Slope_basin=RootMoist[[basin_id]],
         calibrated_params={basin_id: p},
     )
+    # budyko.estimate_budyko_et()
+    # ET_B = budyko.ET_B[basin_id].values
+    
+    # budyko.estimate_budyko_et()
+    # omega_true_all, omega_MLR_all, ET_B = (
+    #     budyko.omega_true,
+    #     budyko.omega_MLR,
+    #     budyko.ET_B,
+    # )
+
     budyko.estimate_budyko_et()
-    ET_B = budyko.ET_B[basin_id].values
+    omega_true_all = budyko.omega_true[basin_id].reindex(idx).to_numpy().ravel()
+    omega_MLR_all  = budyko.omega_MLR[basin_id].reindex(idx).to_numpy().ravel()
+    ET_B           = budyko.ET_B[basin_id].reindex(idx).to_numpy().ravel()
 
     # Model params
     Smax_cal = float(p.get("Smax", 50.0))
@@ -301,14 +315,21 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
             Gmax_cal=Gmax_cal,
             ET_series=ET_ke,
         )
+
         results = pd.DataFrame({
             "time": idx,
+            "omega_true": omega_true_all,
+            "omega_MLR": omega_MLR_all,
             "P": P,
             "PET": PET,
             "ET_ke": ET_ke,
+            "Q_bs" :Qsb,
             "Q_obs": Q_obs,
             "Q_base": Q_base,
+            "S_base": S_base,
+            "G_base": G_base
         }).set_index("time")
+
 
     elif scenario == "BUDYKO":
         Q_budyko, S_budyko, G_budyko = run_model_deterministic(
@@ -326,7 +347,10 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
             "ET_B": ET_B,
             "Q_obs": Q_obs,
             "Q_budyko": Q_budyko,
+            "S_budyko": S_budyko,
+            "G_budyko": G_budyko,
         }).set_index("time")
+
 
     elif scenario == "BUDYKO_DA":
         config = EnKFConfig(**da_cfg)
@@ -357,7 +381,8 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
             "ET_ass": ET_ass_mean,
             "Q_obs": Q_obs,
             "Q_ass": Q_ass,
-            "Q_ass_forecast_mean": Q_ass_mean,
+            "Q_ens": Q_ass_mean,
+            
         }).set_index("time")
 
     else:
@@ -367,18 +392,33 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
     result_path = os.path.join(RESULT_DIR, f"results_{scenario}_{basin_id}.feather")
     results.reset_index().to_feather(result_path)
 
-    # Save EnKF ensemble histories only for DA scenario
+    # # Save EnKF ensemble histories only for DA scenario
+    # if scenario == "BUDYKO_DA" and enkf_hist is not None:
+    #     npz_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.feather")
+    #     np.savez_compressed(
+    #         npz_path,
+    #         time=idx.values.astype("datetime64[ns]"),
+    #         nens=config.nens,
+    #         S_ens=enkf_hist["S_ens"],
+    #         G_ens=enkf_hist["G_ens"],
+    #         ET_ens=enkf_hist["ET_ens"],
+    #         Q_ens=enkf_hist["Q_ens"],
+    #     )
+
     if scenario == "BUDYKO_DA" and enkf_hist is not None:
-        npz_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.npz")
-        np.savez_compressed(
-            npz_path,
-            time=idx.values.astype("datetime64[ns]"),
-            nens=config.nens,
-            S_ens_hist=enkf_hist["S_ens_hist"],
-            G_ens_hist=enkf_hist["G_ens_hist"],
-            ET_ens_hist=enkf_hist["ET_ens_hist"],
-            Q_ens_hist=enkf_hist["Q_ens_hist"],
-        )
+
+        # save ensemble mean as a feather file
+        enkf_df = pd.DataFrame({
+            "time": idx,
+            "ET_ens_mean": np.nanmean(enkf_hist["ET_ens"], axis=1),
+            "Q_ens_mean": np.nanmean(enkf_hist["Q_ens"], axis=1),
+            "S_ens_mean": np.nanmean(enkf_hist["S_ens"], axis=1),
+            "G_ens_mean": np.nanmean(enkf_hist["G_ens"], axis=1),
+        })
+
+        enkf_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.feather")
+        enkf_df.to_feather(enkf_path)
+
 
     # Metrics
     qobs = results["Q_obs"].values if "Q_obs" in results.columns else Q_obs
