@@ -20,7 +20,7 @@ class OmegaMLRModel:
 
     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
         omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
-        return np.clip(omega_MLR, 1.0, 20.0)
+        return np.clip(omega_MLR, 3.0, 20.0)
 
 
 # ---------------------------------------------------------
