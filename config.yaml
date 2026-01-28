@@ -7,7 +7,7 @@ paths:
 
 da:
   enabled: true                 
-  nens: 1000
+  nens: 200
   inflation: 1.08
   R_ET_std: 20.0
   proc_S_std: 0.3            # process/state noise for S
