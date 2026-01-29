@@ -88,13 +88,108 @@ def run_model_deterministic(
     return Q_out, S_out, G_out
 
 
+# # ---------------------------------------------------------
+# # DA run (EnKF) -> produces ET_ass and Q_ass_mean
+# # ---------------------------------------------------------
+# def run_budyko_da(
+#     P: np.ndarray,
+#     PET: np.ndarray,
+#     ET_B: np.ndarray,
+#     params_cal: ModelParams,
+#     S_init: float,
+#     G_init: float,
+#     Smax_cal: float,
+#     Gmax_cal: float,
+#     config: EnKFConfig,
+#     basin_id: str,
+# ):
+#     L = len(P)
+#     nens = int(config.nens)
+#     inflation = float(config.inflation)
+#     R_ET_var = float(config.R_ET_std) ** 2
+
+#     rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
+
+#     # Initial ensemble states [S,G]
+#     S0_ens = np.clip(S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens), 0.0, Smax_cal)
+#     G0_ens = np.clip(G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens), 0.0, Gmax_cal)
+#     X = np.vstack([S0_ens, G0_ens])  
+
+#     # Save ensemble histories
+#     S_ens_hist  = np.full((L, nens), np.nan)
+#     G_ens_hist  = np.full((L, nens), np.nan)
+#     ET_ens_hist = np.full((L, nens), np.nan)
+#     Q_ens_hist  = np.full((L, nens), np.nan)
+
+#     # mean time series
+#     ET_ass_mean = np.full(L, np.nan)
+#     Q_ass_mean  = np.full(L, np.nan)
+
+#     for t in range(L):
+
+#         # Forecast
+#         X_f, ET_ens, Q_ens = enkf_forecast_step_states(
+#             X=X,
+#             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
+#             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
+#             params_cal=params_cal,
+#             Smax=Smax_cal,
+#             Gmax=Gmax_cal,
+#             rng=rng,
+
+#             proc_S_std=float(config.proc_S_std),
+#             proc_G_std=float(config.proc_G_std),
+#             P_std_frac=float(config.P_std_frac),
+#             PET_std_frac=float(config.PET_std_frac),
+            
+
+#             ET_override=None, # This lets the state (S/G) evolve or update
+#         )
+
+#         ET_ens_hist[t, :] = ET_ens
+#         Q_ens_hist[t, :] = Q_ens
+
+#         ET_ass_mean[t] = np.nanmean(ET_ens)
+#         Q_ass_mean[t] = np.nanmean(Q_ens)
+
+#         # Analysis (assimilate ET_B)
+#         if np.isfinite(ET_B[t]):
+#             X = enkf_update_stochastic_scalar(
+#                 X=X_f,
+#                 y_obs=float(ET_B[t]),
+#                 HX=ET_ens.copy(),
+#                 R_var=R_ET_var,
+#                 inflation=inflation,
+#                 Smax=Smax_cal,
+#                 Gmax=Gmax_cal,
+#                 rng=rng,
+#             )
+#         else:
+#             X = X_f
+
+#         S_ens_hist[t, :] = X[0, :]
+#         G_ens_hist[t, :] = X[1, :]
+
+#     enkf_hist = {
+#         "time": np.arange(L),
+#         "nens": nens,
+#         "S_ens": S_ens_hist,
+#         "G_ens": G_ens_hist,
+#         "ET_ens": ET_ens_hist,
+#         "Q_ens": Q_ens_hist,
+#     }
+
+#     return ET_ass_mean, Q_ass_mean, enkf_hist
+
 # ---------------------------------------------------------
-# DA run (EnKF) -> produces ET_ass and Q_ass_mean
+# DA run (EnKF) -> assimilates ET_model toward ET_obs
+# produces ET_ass_mean (posterior) and Q_ass_mean
 # ---------------------------------------------------------
 def run_budyko_da(
     P: np.ndarray,
     PET: np.ndarray,
-    ET_B: np.ndarray,
+    ET_obs: np.ndarray,     # ✅ truth (e.g., ET_B)
+    ET_model: np.ndarray,   # ✅ model (e.g., ET_ke)
     params_cal: ModelParams,
     S_init: float,
     G_init: float,
@@ -111,9 +206,15 @@ def run_budyko_da(
     rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
 
     # Initial ensemble states [S,G]
-    S0_ens = np.clip(S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens), 0.0, Smax_cal)
-    G0_ens = np.clip(G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens), 0.0, Gmax_cal)
-    X = np.vstack([S0_ens, G0_ens])  
+    S0_ens = np.clip(
+        S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens),
+        0.0, Smax_cal
+    )
+    G0_ens = np.clip(
+        G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens),
+        0.0, Gmax_cal
+    )
+    X = np.vstack([S0_ens, G0_ens])  # shape = (2, nens)
 
     # Save ensemble histories
     S_ens_hist  = np.full((L, nens), np.nan)
@@ -121,14 +222,18 @@ def run_budyko_da(
     ET_ens_hist = np.full((L, nens), np.nan)
     Q_ens_hist  = np.full((L, nens), np.nan)
 
-    # mean time series
+    # mean time series (posterior)
     ET_ass_mean = np.full(L, np.nan)
     Q_ass_mean  = np.full(L, np.nan)
 
     for t in range(L):
 
-        # Forecast
-        X_f, ET_ens, Q_ens = enkf_forecast_step_states(
+        # -------------------------------------------------
+        # Forecast: ET is forced to ET_model[t] (ET_ke)
+        # -------------------------------------------------
+        ET_override_t = float(ET_model[t]) if np.isfinite(ET_model[t]) else None
+
+        X_f, ET_ens_f, Q_ens_f = enkf_forecast_step_states(
             X=X,
             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
@@ -141,22 +246,21 @@ def run_budyko_da(
             proc_G_std=float(config.proc_G_std),
             P_std_frac=float(config.P_std_frac),
             PET_std_frac=float(config.PET_std_frac),
-
-            ET_override=None, # This lets the state (S/G) evolve or update
+            ET_override=ET_override_t,
         )
 
-        ET_ens_hist[t, :] = ET_ens
-        Q_ens_hist[t, :] = Q_ens
+        # Save prior (forecast) ET/Q
+        ET_ens_hist[t, :] = ET_ens_f
+        Q_ens_hist[t, :]  = Q_ens_f
 
-        ET_ass_mean[t] = np.nanmean(ET_ens)
-        Q_ass_mean[t] = np.nanmean(Q_ens)
-
-        # Analysis (assimilate ET_B)
-        if np.isfinite(ET_B[t]):
-            X = enkf_update_stochastic_scalar(
+        # -------------------------------------------------
+        # Analysis: assimilate ET_obs[t] (ET_B) into state
+        # -------------------------------------------------
+        if np.isfinite(ET_obs[t]):
+            X_a = enkf_update_stochastic_scalar(
                 X=X_f,
-                y_obs=float(ET_B[t]),
-                HX=ET_ens.copy(),
+                y_obs=float(ET_obs[t]),   # ✅ truth
+                HX=ET_ens_f.copy(),       # ✅ model forecast ET
                 R_var=R_ET_var,
                 inflation=inflation,
                 Smax=Smax_cal,
@@ -164,8 +268,36 @@ def run_budyko_da(
                 rng=rng,
             )
         else:
-            X = X_f
+            X_a = X_f
 
+        # -------------------------------------------------
+        # Posterior: recompute ET/Q from updated states
+        # (so ET_ass reflects assimilation)
+        # -------------------------------------------------
+        X_dummy, ET_ens_a, Q_ens_a = enkf_forecast_step_states(
+            X=X_a,
+            P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
+            PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
+            params_cal=params_cal,
+            Smax=Smax_cal,
+            Gmax=Gmax_cal,
+            rng=rng,
+
+            proc_S_std=0.0,   # no additional noise in posterior evaluation
+            proc_G_std=0.0,
+            P_std_frac=0.0,
+            PET_std_frac=0.0,
+
+            # ✅ keep same ET model forcing
+            ET_override=ET_override_t,
+        )
+
+        # Save posterior means (this is the assimilated ET)
+        ET_ass_mean[t] = np.nanmean(ET_ens_a)
+        Q_ass_mean[t]  = np.nanmean(Q_ens_a)
+
+        # Store updated ensemble states and continue
+        X = X_a
         S_ens_hist[t, :] = X[0, :]
         G_ens_hist[t, :] = X[1, :]
 
@@ -174,11 +306,15 @@ def run_budyko_da(
         "nens": nens,
         "S_ens": S_ens_hist,
         "G_ens": G_ens_hist,
-        "ET_ens": ET_ens_hist,
-        "Q_ens": Q_ens_hist,
+        "ET_ens": ET_ens_hist,   # prior ET ensemble (ET_model-driven)
+        "Q_ens": Q_ens_hist,     # prior Q ensemble
     }
 
     return ET_ass_mean, Q_ass_mean, enkf_hist
+
+
+
+
 
 
 # ---------------------------------------------------------
@@ -298,7 +434,7 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
 
     ET_ke = PET * params_cal.Ke
 
-    enkf_hist = None
+    enkf_hist = None # for saving ensemble history if DA is run
     ET_ass_mean = np.full(L, np.nan)
     Q_ass_mean = np.full(L, np.nan)
 
@@ -353,17 +489,19 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
         config = EnKFConfig(**da_cfg)
 
         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
-            P=P, 
-            PET=PET, 
-            ET_B=ET_ke,
+            P=P,
+            PET=PET,
+            ET_obs=ET_B,      # truth (observation)
+            ET_model=ET_ke,   # model
             params_cal=params_cal,
-            S_init=S_init, 
+            S_init=S_init,
             G_init=G_init,
             Smax_cal=Smax_cal,
             Gmax_cal=Gmax_cal,
             config=config,
             basin_id=basin_id,
         )
+
 
         Q_ass, S_ass, G_ass = run_model_deterministic(
             P=P, PET=PET,
