@@ -7,10 +7,10 @@ paths:
 
 da:
   enabled: true                 
-  nens: 200
-  inflation: 1.08
+  nens: 20
+  inflation: 0.5
   R_ET_std: 20.0
-  proc_S_std: 0.3            # process/state noise for S
+  proc_S_std: 0.13            # process/state noise for S
   proc_G_std: 0.7
   P_std_frac: 0.10          # precipitation perturbation (fraction of P)
   PET_std_frac: 0.03        # PET perturbation (fraction of PET)

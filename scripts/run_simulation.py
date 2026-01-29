@@ -76,7 +76,7 @@ def run_model_deterministic(
 
         S, G, _, Q, *_ = two_store_model_step(
             S, G, P_t, PET_t, params_cal,
-            ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None
+            ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None # given  new ET, update storages (S,G) and compute Q
         )
 
         G = np.clip(G, 0.0, Gmax_cal)
@@ -142,7 +142,7 @@ def run_budyko_da(
             P_std_frac=float(config.P_std_frac),
             PET_std_frac=float(config.PET_std_frac),
 
-            ET_override=None,
+            ET_override=None, # This lets the state (S/G) evolve or update
         )
 
         ET_ens_hist[t, :] = ET_ens
@@ -304,12 +304,13 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
 
     if scenario == "BASE":
         Q_base, S_base, G_base = run_model_deterministic(
-            P=P, PET=PET,
+            P=P, 
+            PET=PET,
             params_cal=params_cal,
             S_init=S_init,
             G_init=G_init,
             Gmax_cal=Gmax_cal,
-            ET_series=ET_ke,
+            ET_series=ET_ke,  # Simple Scaling Based ET
         )
 
         results = pd.DataFrame({
@@ -334,7 +335,7 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
             S_init=S_init,
             G_init=G_init,
             Gmax_cal=Gmax_cal,
-            ET_series=ET_B,
+            ET_series=ET_B,  # Budyko ET
         )
         results = pd.DataFrame({
             "time": idx,
@@ -347,15 +348,19 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
             "G_budyko": G_budyko,
         }).set_index("time")
 
-
+# ET assimilation with Budyko, but Q is determined deterministically
     elif scenario == "BUDYKO_DA":
         config = EnKFConfig(**da_cfg)
 
         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
-            P=P, PET=PET, ET_B=ET_B,
+            P=P, 
+            PET=PET, 
+            ET_B=ET_ke,
             params_cal=params_cal,
-            S_init=S_init, G_init=G_init,
-            Smax_cal=Smax_cal, Gmax_cal=Gmax_cal,
+            S_init=S_init, 
+            G_init=G_init,
+            Smax_cal=Smax_cal,
+            Gmax_cal=Gmax_cal,
             config=config,
             basin_id=basin_id,
         )
