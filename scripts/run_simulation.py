@@ -313,10 +313,6 @@ def run_budyko_da(
     return ET_ass_mean, Q_ass_mean, enkf_hist
 
 
-
-
-
-
 # ---------------------------------------------------------
 # Scenario normalization
 # ---------------------------------------------------------
@@ -361,6 +357,8 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
     Qsb_df = load_feather_df("Qsb.feather", DATA_DIR)
     M_df = load_feather_df("M.feather", DATA_DIR)
     RootMoist = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
+    Slp_df = load_feather_df("slope.feather", DATA_DIR)
+
 
     common_cols = sorted(
         set(Evap_df.columns)
@@ -368,6 +366,7 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
         & set(PET_df.columns)
         & set(M_df.columns)
         & set(RootMoist.columns)
+        & set(Slp_df.columns)
     )
 
     if basin_id not in common_cols or basin_id not in calibrated_params:
@@ -387,8 +386,8 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
     Q_obs = Q_usgs_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
     Q_nldas = Q_nldas_df.get(basin_id, pd.Series(index=idx)).values
     Qsb = Qsb_df.get(basin_id, pd.Series(index=idx)).values
-
-    ET_nldas = Evap_df[basin_id].values
+    Slp = Slp_df.get(basin_id, pd.Series(index=idx)).values
+    # ET_nldas = Evap_df[basin_id].values
 
     # Budyko ET
     M_basin = M_df.copy()
@@ -398,14 +397,15 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
     Qsb_df  = Qsb_df[common_cols]
     PET_df  = PET_df[common_cols]
     M_df    = M_df[common_cols]
+    Slp_df    = Slp_df[common_cols]
     RootMoist = RootMoist[common_cols]
 
     budyko = BudykoModelEstimator(
         Evap_df=Evap_df[common_cols],
         Qsb_monthly=Qsb_df[common_cols],
         PotEvap_df=PET_df[common_cols],
-        M_basin=M_df[common_cols],
-        Slope_basin=RootMoist[common_cols],  # but this should be slope, not soil moisture
+        M_basin=RootMoist[common_cols],
+        Slope_basin=Slp_df[common_cols],  
         calibrated_params=calibrated_params,
     )
 
@@ -434,7 +434,7 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
 
     ET_ke = PET * params_cal.Ke
 
-    enkf_hist = None # for saving ensemble history if DA is run
+    enkf_hist = None # NO DA
     ET_ass_mean = np.full(L, np.nan)
     Q_ass_mean = np.full(L, np.nan)
 
@@ -451,8 +451,6 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
 
         results = pd.DataFrame({
             "time": idx,
-            "omega_true": omega_true_all,
-            "omega_MLR": omega_MLR_all,
             "P": P,
             "PET": PET,
             "ET_ke": ET_ke,
@@ -475,6 +473,8 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
         )
         results = pd.DataFrame({
             "time": idx,
+            "omega_true": omega_true_all,
+            "omega_MLR": omega_MLR_all,
             "P": P,
             "PET": PET,
             "ET_B": ET_B,
@@ -485,14 +485,15 @@ def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, 
         }).set_index("time")
 
 # ET assimilation with Budyko, but Q is determined deterministically
+
     elif scenario == "BUDYKO_DA":
         config = EnKFConfig(**da_cfg)
 
         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
             P=P,
             PET=PET,
-            ET_obs=ET_B,      # truth (observation)
-            ET_model=ET_ke,   # model
+            ET_obs=ET_B,      # true
+            ET_model=ET_ke,   # model, assummed as model value to be corrected in the DA
             params_cal=params_cal,
             S_init=S_init,
             G_init=G_init,
@@ -640,4 +641,5 @@ def run_simulations_from_config(cfg: dict):
         )
 
         print(f"\n✅ Completed successfully: scenario={scenario}. Results saved to {RESULT_DIR}")
+
 
