@@ -1,11 +1,50 @@
-# scripts/run_simulation.py
+"""
+run_simulation.py — Basin-scale hydrological simulation driver (SAC-SMA version).
+
+Input files required (all feather, columns = basin IDs, index = time)
+----------------------------------------------------------------------
+PRCP.feather          precipitation
+PotEvap.feather       potential ET
+ET_sacsma.feather     actual ET simulated by SAC-SMA  ← replaces ET_ke / Evap
+Q_SACSMA.feather      streamflow simulated by SAC-SMA ← used as reference
+Q_USGS.feather        observed USGS streamflow        ← evaluation target
+M.feather             vegetation / moisture index     ← omega MLR
+slope.feather         terrain slope                   ← omega MLR
+
+NOT required (removed vs NLDAS version)
+----------------------------------------
+EVap.feather, Qsb.feather, SoilM_0_200cm.feather
+
+Three scenarios
+---------------
+BASE        two-store model forced with ET = ET_sacsma (SAC-SMA physically modelled ET)
+BUDYKO      two-store model forced with ET = ET_B (Fu–Budyko equation)
+BUDYKO_DA   state-only EnSRF: assimilates ET_sacsma as observation into [S, G] states
+            + optionally assimilates Q_USGS as a second sequential update
+
+Design notes
+------------
+* The two-store bucket model propagates [S, G] internally in the EnKF.
+  S_init / G_init / Smax / Gmax come from calibrated_params.json as before.
+* ET_sacsma is the assimilation OBSERVATION in DA (replaces ET_B).
+  ET_B from Budyko is still computed for the BUDYKO scenario and is stored
+  as a diagnostic column in DA results.
+* All three EnKF fixes from the previous version are retained:
+    FIX 1  P_eff capped at P for Budyko ET computation
+    FIX 2  proc_S_std / proc_G_std treated as fractions of Smax/Gmax
+    FIX 3  Innovation outlier rejection with relative floor
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
 import os
 import sys
-import json
-import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import cpu_count
 
+import json
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -14,173 +53,209 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# ✅ DO NOT import anything from run.py (avoids circular import)
-
 from src.model import ModelParams, two_store_model_step
 from src.budyko import BudykoModelEstimator
-from src.enkf import EnKFConfig, enkf_update_stochastic_scalar, enkf_forecast_step_states
+from src.enkf import (
+    EnKFConfig,
+    enkf_analysis_step,
+    enkf_forecast_step_states,
+)
 from src.metrics import calculate_kge, calculate_nse
 
 
 # =========================================================
-# GLOBALS
+# PROCESS-LOCAL GLOBALS
 # =========================================================
-_GLOBAL = {
-    "PET_df": None,
-    "Rainf_df": None,
-    "Evap_df": None,
-    "Q_usgs_df": None,
-    "Q_nldas_df": None,
-    "Qsb_df": None,
-    "M_df": None,
-    "RootMoist_df": None,
-    "Slp_df": None,
-    "common_cols": None,
-    # NOTE: state-aware Budyko is no longer precomputed globally/offline
+_GLOBAL: dict = {
+    "PET_df":            None,
+    "Rainf_df":          None,
+    "ET_sacsma_df":      None,   # SAC-SMA actual ET  ← NEW
+    "Q_sacsma_df":       None,   # SAC-SMA streamflow ← NEW
+    "Q_usgs_df":         None,
+    "M_df":              None,
+    "Slp_df":            None,
+    "common_cols":       None,
+    "idx":               None,
     "calibrated_params": None,
-    # ✅ NEW: global omega MLR coefficients (beta0, beta1, beta2)
-    "omega_mlr_beta": None,
+    "omega_mlr_beta":    None,
 }
 
 
+# =========================================================
+# HELPERS
+# =========================================================
+
 def scenario_folder_name(scenario: str) -> str:
     s = str(scenario).strip().upper()
-
-    if s == "BASE":
-        return "BASE_MODEL"
-    elif s == "BUDYKO":
-        return "BUDYKO_MODEL"
-    elif s in ["BUDYKO_DA", "BUDYKO+DA", "DA", "ENKF"]:
+    if s == "BASE":   return "BASE_MODEL"
+    if s == "BUDYKO": return "BUDYKO_MODEL"
+    if s in ["BUDYKO_DA", "BUDYKO+DA", "DA", "ENKF"]:
         return "BUDYKO_DA"
-    else:
-        return f"{s}_SCENARIO"
+    return f"{s}_SCENARIO"
 
 
-# ---------------------------------------------------------
-# Feather loader
-# ---------------------------------------------------------
+def normalize_scenario_key(s: str) -> str:
+    s = str(s).strip().upper()
+    mapping = {
+        "ALL": "ALL", "BASE": "BASE", "BASE_MODEL": "BASE",
+        "BASE-MODEL": "BASE", "BUDYKO": "BUDYKO",
+        "BUDYKO_MODEL": "BUDYKO", "BUDYKO-MODEL": "BUDYKO",
+        "BUDYKO_DA": "BUDYKO_DA", "BUDYKO_DA_MODEL": "BUDYKO_DA",
+        "BUDYKO+DA": "BUDYKO_DA", "DA": "BUDYKO_DA",
+        "ENKF": "BUDYKO_DA", "ASSIMILATION": "BUDYKO_DA",
+    }
+    if s not in mapping:
+        raise ValueError(f"Unknown scenario: {s!r}")
+    return mapping[s]
+
+
+def _stable_seed(basin_id: str) -> int:
+    """Reproducible 32-bit seed from basin ID string (MD5, not hash())."""
+    digest = hashlib.md5(basin_id.encode()).digest()
+    return int.from_bytes(digest[:4], byteorder="little")
+
+
 def load_feather_df(fname: str, ddir: str) -> pd.DataFrame:
+    """
+    Load a feather file and normalise the time axis to a DatetimeIndex
+    named 'time'.
+
+    Handles three layouts present in this project:
+      1. 'Date' column  -> PotEvap, Rainf, Q_SACSMA, Q_USGS, Evap
+      2. 'time' column  -> M
+      3. DatetimeIndex already set -> slope
+    """
     path = os.path.join(ddir, fname)
     if not os.path.exists(path):
         logging.warning(f"File not found: {path}. Returning empty DataFrame.")
         return pd.DataFrame()
-
     df = pd.read_feather(path).dropna(axis=1, how="all")
-
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"])
-        df.set_index("time", inplace=True)
-
+    for candidate in ("Date", "date", "time", "TIME"):
+        if candidate in df.columns:
+            df[candidate] = pd.to_datetime(df[candidate])
+            df = df.set_index(candidate)
+            df.index.name = "time"
+            return df
+    if isinstance(df.index, pd.DatetimeIndex):
+        df.index.name = "time"
+        return df
     return df
 
 
-# ---------------------------------------------------------
-# Load all inputs once
-# ---------------------------------------------------------
-def load_all_inputs(DATA_DIR: str) -> dict:
-    PET_df = load_feather_df("PotEvap.feather", DATA_DIR)
-    Rainf_df = load_feather_df("Rainf.feather", DATA_DIR)
-    Evap_df = load_feather_df("EVap.feather", DATA_DIR)
-    Q_usgs_df = load_feather_df("Q_USGS.feather", DATA_DIR)
-    Q_nldas_df = load_feather_df("Q_nldas_mm_monthly.feather", DATA_DIR)
-    Qsb_df = load_feather_df("Qsb.feather", DATA_DIR)
-    M_df = load_feather_df("M.feather", DATA_DIR)
-    RootMoist_df = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
-    Slp_df = load_feather_df("slope.feather", DATA_DIR)
-
-    common_cols = sorted(
-        set(Evap_df.columns)
-        & set(Qsb_df.columns)
-        & set(PET_df.columns)
-        & set(M_df.columns)
-        & set(RootMoist_df.columns)
-        & set(Slp_df.columns)
-        & set(Rainf_df.columns)  # ✅ ensure P exists for state-aware Budyko
-    )
-
-    if len(common_cols) > 0:
-        Evap_df = Evap_df[common_cols]
-        Qsb_df = Qsb_df[common_cols]
-        PET_df = PET_df[common_cols]
-        M_df = M_df[common_cols]
-        RootMoist_df = RootMoist_df[common_cols]
-        Slp_df = RootMoist_df[common_cols]
-        Rainf_df = Rainf_df[common_cols]
-
-    return {
-        "PET_df": PET_df,
-        "Rainf_df": Rainf_df,
-        "Evap_df": Evap_df,
-        "Q_usgs_df": Q_usgs_df,
-        "Q_nldas_df": Q_nldas_df,
-        "Qsb_df": Qsb_df,
-        "M_df": M_df,
-        "RootMoist_df": RootMoist_df,
-        "Slp_df": Slp_df,
-        "common_cols": common_cols,
-    }
-
-
-# ---------------------------------------------------------
-# Worker initializer (sets globals once per worker)
-# ---------------------------------------------------------
-def _init_worker(global_payload: dict):
+def _init_worker(global_payload: dict) -> None:
     _GLOBAL.update(global_payload)
 
 
-# # ---------------------------------------------------------
-# # Deterministic single-run model (captures dS)
-# # ---------------------------------------------------------
-# def run_model_deterministic(
-#     P: np.ndarray,
-#     PET: np.ndarray,
-#     params_cal: ModelParams,
-#     S_init: float,
-#     G_init: float,
-#     Gmax_cal: float,
-#     ET_series: np.ndarray,
-# ):
-#     L = len(P)
-#     S, G = float(S_init), float(G_init)
+# =========================================================
+# DATA LOADING
+# =========================================================
 
-#     Q_out = np.full(L, np.nan)
-#     S_out = np.full(L, np.nan)
-#     G_out = np.full(L, np.nan)
-#     dS_out = np.full(L, np.nan)
+def load_all_inputs(DATA_DIR: str) -> dict:
+    """
+    Load all required feather files.
 
-#     for t in range(L):
-#         P_t = float(P[t]) if np.isfinite(P[t]) else 0.0
-#         PET_t = float(PET[t]) if np.isfinite(PET[t]) else 0.0
+    Required
+    --------
+    PRCP.feather, PotEvap.feather, ET_sacsma.feather,
+    Q_SACSMA.feather, M.feather, slope.feather
 
-#         S, G, _, Q, *_rest = two_store_model_step(
-#             S,
-#             G,
-#             P_t,
-#             PET_t,
-#             params_cal,
-#             ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None,
-#         )
+    Optional
+    --------
+    Q_USGS.feather  (used for evaluation; basins without gauge data get NaN)
+    """
+    PET_df       = load_feather_df("PotEvap.feather", DATA_DIR)
+    Rainf_df     = load_feather_df("Rainf.feather",   DATA_DIR)
+    ET_sacsma_df = load_feather_df("Evap.feather",    DATA_DIR)  # SAC-SMA actual ET
+    Q_sacsma_df  = load_feather_df("Q_SACSMA.feather",DATA_DIR)
+    Q_usgs_df    = load_feather_df("Q_USGS.feather",  DATA_DIR)
+    M_df         = load_feather_df("M.feather",       DATA_DIR)
+    Slp_df       = load_feather_df("slope.feather",   DATA_DIR)
 
-#         # model.py now returns (..., Perc_t, dS) at the end
-#         dS_t = np.nan
-#         if len(_rest) >= 1:
-#             # _rest layout from model.py:
-#             # Qs_t, Qb_t, Perc_t, dS
-#             if len(_rest) >= 4:
-#                 dS_t = float(_rest[-1]) if np.isfinite(_rest[-1]) else np.nan
+    # These are strictly required
+    required = {
+        "PotEvap.feather": PET_df,
+        "Rainf.feather":   Rainf_df,
+        "Evap.feather":    ET_sacsma_df,
+        "Q_SACSMA.feather":Q_sacsma_df,
+        "M.feather":       M_df,
+        "slope.feather":   Slp_df,
+    }
+    for name, df in required.items():
+        if df.empty:
+            raise ValueError(f"Required input is empty or missing: {name}")
 
-#         G = np.clip(G, 0.0, Gmax_cal)
+    # Common basin columns across all required files
+    common_cols = sorted(
+        set(PET_df.columns)
+        & set(Rainf_df.columns)
+        & set(ET_sacsma_df.columns)
+        & set(Q_sacsma_df.columns)
+        & set(M_df.columns)
+        & set(Slp_df.columns)
+    )
+    if not common_cols:
+        raise ValueError(
+            "No common basin columns across required inputs. "
+            "Check that all feather files share the same basin ID column names."
+        )
 
-#         Q_out[t] = max(Q, 0.0)
-#         S_out[t] = S
-#         G_out[t] = G
-#         dS_out[t] = dS_t
+    # Common time index across all required files
+    common_idx = (
+        PET_df.index
+        .intersection(Rainf_df.index)
+        .intersection(ET_sacsma_df.index)
+        .intersection(Q_sacsma_df.index)
+        .intersection(M_df.index)
+        .intersection(Slp_df.index)
+    )
+    # Q_USGS is optional — intersect only if present
+    if not Q_usgs_df.empty:
+        common_idx = common_idx.intersection(Q_usgs_df.index)
 
-#     return Q_out, S_out, G_out, dS_out
+    if len(common_idx) == 0:
+        raise ValueError(
+            "No overlapping time steps across required inputs. "
+            "Check that all feather files share the same time index."
+        )
 
-# ---------------------------------------------------------
-# Deterministic single-run model (captures dS)
-# ---------------------------------------------------------
+    # Align all frames
+    PET_df       = PET_df.loc[common_idx, common_cols]
+    Rainf_df     = Rainf_df.loc[common_idx, common_cols]
+    ET_sacsma_df = ET_sacsma_df.loc[common_idx, common_cols]
+    Q_sacsma_df  = Q_sacsma_df.loc[common_idx, common_cols]
+    M_df         = M_df.loc[common_idx, common_cols]
+    Slp_df       = Slp_df.loc[common_idx, common_cols]
+
+    if Q_usgs_df.empty:
+        # No gauge data at all — fill with NaN so downstream code is NaN-safe
+        Q_usgs_df = pd.DataFrame(
+            np.nan, index=common_idx, columns=common_cols
+        )
+    else:
+        # Keep only basins that also appear in the required files
+        qobs_cols = sorted(set(Q_usgs_df.columns) & set(common_cols))
+        Q_usgs_df = Q_usgs_df.loc[common_idx, qobs_cols]
+
+    print(f"  Loaded {len(common_cols)} basins × {len(common_idx)} time steps.")
+    print(f"  Period: {common_idx[0].date()} → {common_idx[-1].date()}")
+
+    return dict(
+        PET_df       = PET_df,
+        Rainf_df     = Rainf_df,
+        ET_sacsma_df = ET_sacsma_df,
+        Q_sacsma_df  = Q_sacsma_df,
+        Q_usgs_df    = Q_usgs_df,
+        M_df         = M_df,
+        Slp_df       = Slp_df,
+        common_cols  = common_cols,
+        idx          = common_idx,
+    )
+
+
+# =========================================================
+# DETERMINISTIC TWO-STORE MODEL RUN
+# =========================================================
+
 def run_model_deterministic(
     P: np.ndarray,
     PET: np.ndarray,
@@ -189,176 +264,189 @@ def run_model_deterministic(
     G_init: float,
     Gmax_cal: float,
     ET_series: np.ndarray,
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Run the two-store model deterministically for a full time series.
+
+    ET_series is passed as ET_override each step.  NaN entries in ET_series
+    cause the model to fall back to its internal stress-based ET calculation.
+
+    Returns
+    -------
+    Q_out, S_out, G_out, dS_out : each shape (L,)
+    """
     L = len(P)
     S, G = float(S_init), float(G_init)
-
     Q_out  = np.full(L, np.nan)
     S_out  = np.full(L, np.nan)
     G_out  = np.full(L, np.nan)
     dS_out = np.full(L, np.nan)
 
     for t in range(L):
-        P_t   = float(P[t]) if np.isfinite(P[t]) else 0.0
-        PET_t = float(PET[t]) if np.isfinite(PET[t]) else 0.0
+        P_t   = float(P[t])         if np.isfinite(P[t])         else 0.0
+        PET_t = float(PET[t])       if np.isfinite(PET[t])       else 0.0
+        ET_t  = float(ET_series[t]) if np.isfinite(ET_series[t]) else None
 
-        # ✅ store previous soil state
-        # store previous soil state (no longer needed for dS, but fine to keep)
-        S_prev = S
-
-        S, G, _ET, Q, Qs_t, Qb_t, Perc_t, dS_t = two_store_model_step(
-            S,
-            G,
-            P_t,
-            PET_t,
-            params_cal,
-            ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None,
+        S, G, _, Q, _, _, _, dS_t = two_store_model_step(
+            S, G, P_t, PET_t, params_cal, ET_override=ET_t,
         )
+        G = float(np.clip(G, 0.0, Gmax_cal))
 
-        G = np.clip(G, 0.0, Gmax_cal)
-
-        Q_out[t]  = max(Q, 0.0)
-        S_out[t]  = S
-        G_out[t]  = G
-        dS_out[t] = dS_t
-
+        Q_out[t]  = max(float(Q), 0.0)
+        S_out[t]  = float(S)
+        G_out[t]  = float(G)
+        dS_out[t] = float(dS_t) if np.isfinite(dS_t) else np.nan
 
     return Q_out, S_out, G_out, dS_out
 
-# ---------------------------------------------------------
-# Budyko Fu ET (state-aware via P_eff = P - dS)
-# ---------------------------------------------------------
-def fu_et_from_peff(P_eff: np.ndarray, PET: np.ndarray, omega: np.ndarray) -> np.ndarray:
+
+# =========================================================
+# FU–BUDYKO ET  (used for BUDYKO scenario only)
+# =========================================================
+
+def fu_et_from_peff(
+    P_eff: np.ndarray,
+    PET: np.ndarray,
+    omega: np.ndarray,
+) -> np.ndarray:
+    """
+    ET/P_eff = 1 + φ − (1 + φ^ω)^(1/ω),  φ = PET / P_eff.
+    Result clipped to [0, min(P_eff, PET)].
+    """
     P_eff = np.asarray(P_eff, dtype=float)
-    PET = np.asarray(PET, dtype=float)
-    omega = np.asarray(omega, dtype=float)
+    PET   = np.asarray(PET,   dtype=float)
+    omega = np.asarray(omega,  dtype=float)
+    ET    = np.full_like(P_eff, np.nan)
 
-    ET = np.full_like(P_eff, np.nan, dtype=float)
-
-    ok = np.isfinite(P_eff) & np.isfinite(PET) & np.isfinite(omega) & (P_eff > 0) & (PET >= 0) & (omega > 0)
+    ok = (
+        np.isfinite(P_eff) & np.isfinite(PET) & np.isfinite(omega)
+        & (P_eff > 0.0) & (PET >= 0.0) & (omega > 0.0)
+    )
     if not np.any(ok):
         return ET
 
-    phi = np.divide(PET[ok], P_eff[ok], out=np.full(np.sum(ok), np.nan), where=P_eff[ok] > 0)
-
+    phi = PET[ok] / P_eff[ok]
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        term = np.power(phi, omega[ok])
+        term     = np.power(phi, omega[ok])
         e_over_p = 1.0 + phi - np.power(1.0 + term, 1.0 / omega[ok])
-
     e_over_p = np.where(np.isfinite(e_over_p), e_over_p, np.nan)
-    ET_ok = P_eff[ok] * e_over_p
-
-    # physical clipping
-    ET_ok = np.clip(ET_ok, 0.0, np.minimum(P_eff[ok], PET[ok]))
-
-    ET[ok] = ET_ok
+    ET[ok]   = np.clip(
+        P_eff[ok] * e_over_p, 0.0, np.minimum(P_eff[ok], PET[ok])
+    )
     return ET
 
 
-# ---------------------------------------------------------
-# ✅ NEW: Fit global omega MLR once (across all basins & time)
-# ---------------------------------------------------------
+# =========================================================
+# GLOBAL OMEGA MLR FIT  (needed for BUDYKO scenario)
+# =========================================================
+
 def fit_global_omega_mlr(
-    basins: list,
+    basins: list[str],
     idx: pd.DatetimeIndex,
     PET_df: pd.DataFrame,
     Rainf_df: pd.DataFrame,
+    ET_sacsma_df: pd.DataFrame,
     M_df: pd.DataFrame,
     Slp_df: pd.DataFrame,
     calibrated_params: dict,
-):
-    rows = []
-    targets = []
+) -> np.ndarray:
+    """
+    Pool OLS: ω = β₀ + β₁·M + β₂·slope  across all basins.
+
+    omega_true is inverted from the Fu–Budyko equation using
+    ET_sacsma (SAC-SMA ET) as the target actual ET, and P_eff = P - dS
+    from a warm-up two-store run driven by ET_sacsma.
+
+    Returns
+    -------
+    beta : ndarray shape (3,)  [intercept, β_M, β_slope]
+    """
+    rows: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
 
     for basin_id in basins:
         if basin_id not in calibrated_params:
             continue
 
-        p = calibrated_params[basin_id]
+        p           = calibrated_params[basin_id]
+        PET         = PET_df[basin_id].reindex(idx).to_numpy(dtype=float)
+        P           = Rainf_df[basin_id].reindex(idx).to_numpy(dtype=float)
+        ET_sac      = ET_sacsma_df[basin_id].reindex(idx).to_numpy(dtype=float)
 
-        # Basin series
-        PET = PET_df[basin_id].reindex(idx).to_numpy().ravel().astype(float)
-        P = Rainf_df[basin_id].reindex(idx).to_numpy().ravel().astype(float)
-
-        # params for BASE pass to get dS_base
-        Smax_cal = float(p.get("Smax", 50.0))
+        Smax_cal    = float(p.get("Smax", 50.0))
         Gmax_factor = float(p.get("Gmax_factor", 4.0))
-        Gmax_cal = Smax_cal * Gmax_factor
-        S_init = float(p.get("S_init", 0.5 * Smax_cal))
-        G_init = float(p.get("G_init", 0.5 * Gmax_cal))
+        Gmax_cal    = Smax_cal * Gmax_factor
+        S_init      = float(p.get("S_init", 0.5 * Smax_cal))
+        G_init      = float(p.get("G_init", 0.5 * Gmax_cal))
 
         params_cal = ModelParams(
             Smax=Smax_cal,
-            Kperc=p["Kperc"],
-            Kb=p["Kb"],
-            Ke=p["Ke"],
-            Cqq=p["Cqq"],
-            Sfc_frac=0.30,
-            beta_et=2.0,
+            Kperc=float(p["Kperc"]), Kb=float(p["Kb"]),
+            Ke=float(p["Ke"]),       Cqq=float(p["Cqq"]),
+            Sfc_frac=0.30, beta_et=2.0,
         )
 
-        ET_ke = PET * float(params_cal.Ke)
-
-        # BASE pass to get dS_base (state-aware)
+        # Warm-up run driven by ET_sacsma to get dS
         _, _, _, dS_base = run_model_deterministic(
-            P=P,
-            PET=PET,
-            params_cal=params_cal,
-            S_init=S_init,
-            G_init=G_init,
-            Gmax_cal=Gmax_cal,
-            ET_series=ET_ke,
+            P=P, PET=PET, params_cal=params_cal,
+            S_init=S_init, G_init=G_init, Gmax_cal=Gmax_cal,
+            ET_series=ET_sac,
         )
 
-        # Build per-basin Budyko estimator ONLY to compute omega_true
-        P_df_b = pd.DataFrame({basin_id: P}, index=idx)
-        dS_df_b = pd.DataFrame({basin_id: dS_base}, index=idx)
-        PET_df_b = pd.DataFrame({basin_id: PET}, index=idx)
+        # FIX 1: cap P_eff at P
+        P_eff_base = np.clip((P - dS_base).astype(float), 1e-6, P)
 
+        # Use BudykoModelEstimator to invert omega_true from ET_sacsma
         bud = BudykoModelEstimator(
-            P_df=P_df_b,
-            dS_df=dS_df_b,
-            PotEvap_df=PET_df_b,
-            M_basin=M_df[[basin_id]].reindex(idx),
-            Slope_basin=Slp_df[[basin_id]].reindex(idx),
-            calibrated_params=calibrated_params,
-            Ke_df=None,
+            P_df       = pd.DataFrame({basin_id: P},        index=idx),
+            dS_df      = pd.DataFrame({basin_id: dS_base},  index=idx),
+            PotEvap_df = pd.DataFrame({basin_id: PET},      index=idx),
+            M_basin    = M_df[[basin_id]].reindex(idx),
+            Slope_basin= Slp_df[[basin_id]].reindex(idx),
+            calibrated_params = calibrated_params,
+            Ke_df      = None,
         )
-        omega_true_df = bud.compute_omega_true()
-        omega_true = omega_true_df[basin_id].reindex(idx).to_numpy().ravel().astype(float)
+        omega_true = (
+            bud.compute_omega_true()[basin_id]
+            .reindex(idx).to_numpy(dtype=float)
+        )
 
-        # predictors
-        Mi = M_df[basin_id].reindex(idx).to_numpy().ravel().astype(float)
+        M_series  = M_df[basin_id].reindex(idx).to_numpy(dtype=float)
+        slope_col = Slp_df[basin_id].reindex(idx)
+        slope_val = (
+            float(slope_col.dropna().iloc[0])
+            if slope_col.notna().any() else np.nan
+        )
+        S_series  = np.full_like(M_series, slope_val, dtype=float)
 
-        # slope is constant per basin; broadcast to time
-        slope_val = Slp_df[basin_id].iloc[0] if basin_id in Slp_df.columns else np.nan
-        Si = np.full_like(Mi, float(slope_val) if np.isfinite(slope_val) else np.nan, dtype=float)
-
-        mask = np.isfinite(Mi) & np.isfinite(Si) & np.isfinite(omega_true)
+        mask = (
+            np.isfinite(M_series)
+            & np.isfinite(S_series)
+            & np.isfinite(omega_true)
+        )
         if np.any(mask):
-            Xi = np.column_stack([np.ones(mask.sum()), Mi[mask], Si[mask]])
-            rows.append(Xi)
+            rows.append(np.column_stack([
+                np.ones(mask.sum()), M_series[mask], S_series[mask]
+            ]))
             targets.append(omega_true[mask])
 
     if not rows:
-        raise ValueError("No valid data to fit GLOBAL omega MLR (check M/Slope/omega_true availability).")
+        raise ValueError("No valid data to fit global omega MLR.")
 
-    X = np.vstack(rows)
-    Y = np.concatenate(targets)
+    beta, _, _, _ = np.linalg.lstsq(
+        np.vstack(rows), np.concatenate(targets), rcond=None
+    )
+    return beta
 
-    beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-    return beta  # (beta0, beta1, beta2)
 
+# =========================================================
+# STATE-ONLY ENKF DA
+# =========================================================
 
-# ---------------------------------------------------------
-# DA run (EnKF) -> assimilates ET_model toward ET_obs
-# produces ET_ass_mean (posterior) and Q_ass_mean
-# ---------------------------------------------------------
 def run_budyko_da(
     P: np.ndarray,
     PET: np.ndarray,
-    ET_obs: np.ndarray,     # truth (e.g., ET_B)
-    ET_model: np.ndarray,   # model (e.g., ET_ke)
+    ET_obs: np.ndarray,        # ET_sacsma — the assimilation observation
     params_cal: ModelParams,
     S_init: float,
     G_init: float,
@@ -366,470 +454,512 @@ def run_budyko_da(
     Gmax_cal: float,
     config: EnKFConfig,
     basin_id: str,
-):
-    L = len(P)
+    Q_obs: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    State-only EnSRF DA loop assimilating ET_sacsma as the observation.
+
+    Cycle per time step
+    -------------------
+    1. Forecast   : propagate [S, G] ensemble through two-store model
+                    with process noise + forcing perturbations
+    2. Analysis ET: deterministic scalar EnSRF update using ET_sacsma
+                    (innovation-capped to prevent ensemble collapse)
+    3. Analysis Q : optional second sequential update using Q_USGS
+    4. Inflation  : multiplicative anomaly inflation
+    5. Re-forecast: zero-perturbation pass from X_a → clean ET_ass, Q_ass
+
+    Fixes applied
+    -------------
+    FIX 2  proc_S_std / proc_G_std treated as fractions of Smax/Gmax.
+           Values < 2.0 are interpreted as fractions; ≥ 2.0 as absolute mm.
+    FIX 3  Innovation cap = max(3σ_prior, 30%|ET_obs|, R_ET_std).
+           The relative floor keeps the window open when ET_sacsma is large.
+    """
+    L    = len(P)
     nens = int(config.nens)
-    inflation = float(config.inflation)
-    R_ET_var = float(config.R_ET_std) ** 2
+    rng  = np.random.default_rng(_stable_seed(basin_id))
 
-    rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
+    # ---- FIX 2: fractional → absolute process noise --------------
+    proc_S_abs = (
+        float(config.proc_S_std) * Smax_cal
+        if float(config.proc_S_std) < 2.0
+        else float(config.proc_S_std)
+    )
+    proc_G_abs = (
+        float(config.proc_G_std) * Gmax_cal
+        if float(config.proc_G_std) < 2.0
+        else float(config.proc_G_std)
+    )
 
-    # Initial ensemble states [S,G]
+    basin_cfg = EnKFConfig(
+        nens         = config.nens,
+        inflation    = config.inflation,
+        R_ET_std     = config.R_ET_std,
+        R_Q_std      = config.R_Q_std,
+        R_ET_frac    = config.R_ET_frac,
+        R_Q_frac     = config.R_Q_frac,
+        proc_S_std   = proc_S_abs,
+        proc_G_std   = proc_G_abs,
+        P_std_frac   = config.P_std_frac,
+        PET_std_frac = config.PET_std_frac,
+    )
+
+    # ---- Initial ensemble ----------------------------------------
     S0_ens = np.clip(
-        S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens),
-        0.0, Smax_cal
+        S_init + rng.normal(0.0, 0.10 * Smax_cal, nens), 0.0, Smax_cal
     )
     G0_ens = np.clip(
-        G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens),
-        0.0, Gmax_cal
+        G_init + rng.normal(0.0, 0.10 * Gmax_cal, nens), 0.0, Gmax_cal
     )
-    X = np.vstack([S0_ens, G0_ens])  # shape = (2, nens)
+    X = np.vstack([S0_ens, G0_ens])   # (2, nens)
 
-    # Save ensemble histories
+    # ---- Output arrays -------------------------------------------
     S_ens_hist  = np.full((L, nens), np.nan)
     G_ens_hist  = np.full((L, nens), np.nan)
     ET_ens_hist = np.full((L, nens), np.nan)
     Q_ens_hist  = np.full((L, nens), np.nan)
 
-    # mean time series (posterior)
+    innov_ET_hist = np.full(L, np.nan)
+    innov_Q_hist  = np.full(L, np.nan)
+    spread_S_hist = np.full(L, np.nan)
+    spread_G_hist = np.full(L, np.nan)
+    spread_Q_hist = np.full(L, np.nan)
+
     ET_ass_mean = np.full(L, np.nan)
     Q_ass_mean  = np.full(L, np.nan)
 
+    # Warm-start innovation cap from first ET_sacsma value
+    et0 = float(ET_obs[np.isfinite(ET_obs)][0]) if np.any(np.isfinite(ET_obs)) else 30.0
+    prev_et_mean   = et0
+    prev_et_spread = 0.3 * et0
+
     for t in range(L):
+        P_t   = float(P[t])   if np.isfinite(P[t])   else 0.0
+        PET_t = float(PET[t]) if np.isfinite(PET[t]) else 0.0
 
-        # Forecast: ET is forced to ET_model[t] (ET_ke)
-        ET_override_t = float(ET_model[t]) if np.isfinite(ET_model[t]) else None
-
-        X_f, ET_ens_f, Q_ens_f = enkf_forecast_step_states(
-            X=X,
-            P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-            PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-            params_cal=params_cal,
-            Smax=Smax_cal,
-            Gmax=Gmax_cal,
-            rng=rng,
-
-            proc_S_std=float(config.proc_S_std),
-            proc_G_std=float(config.proc_G_std),
-            P_std_frac=float(config.P_std_frac),
-            PET_std_frac=float(config.PET_std_frac),
-            ET_override=ET_override_t,
+        # ---- Observations ----------------------------------------
+        y_ET_raw = (
+            float(ET_obs[t])
+            if ET_obs is not None and np.isfinite(ET_obs[t])
+            else None
+        )
+        y_Q = (
+            float(Q_obs[t])
+            if Q_obs is not None and np.isfinite(Q_obs[t])
+            else None
         )
 
-        # Save prior (forecast) ET/Q
-        ET_ens_hist[t, :] = ET_ens_f
-        Q_ens_hist[t, :]  = Q_ens_f
-
-        # Analysis: assimilate ET_obs[t] (ET_B) into state
-        if np.isfinite(ET_obs[t]):
-            X_a = enkf_update_stochastic_scalar(
-                X=X_f,
-                y_obs=float(ET_obs[t]),
-                HX=ET_ens_f.copy(),
-                R_var=R_ET_var,
-                inflation=inflation,
-                Smax=Smax_cal,
-                Gmax=Gmax_cal,
-                rng=rng,
+        # ---- FIX 3: innovation outlier rejection -----------------
+        if y_ET_raw is not None:
+            cap = max(
+                3.0 * prev_et_spread,
+                0.30 * abs(y_ET_raw),
+                float(basin_cfg.R_ET_std),
             )
+            y_ET = float(np.clip(
+                y_ET_raw,
+                prev_et_mean - cap,
+                prev_et_mean + cap,
+            ))
         else:
-            X_a = X_f
+            y_ET = None
 
-        # Posterior: recompute ET/Q from updated states (no extra noise)
-        _, ET_ens_a, Q_ens_a = enkf_forecast_step_states(
-            X=X_a,
-            P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-            PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-            params_cal=params_cal,
-            Smax=Smax_cal,
-            Gmax=Gmax_cal,
-            rng=rng,
-
-            proc_S_std=0.0,
-            proc_G_std=0.0,
-            P_std_frac=0.0,
-            PET_std_frac=0.0,
-
-            ET_override=ET_override_t,
+        # ---- Forecast + Analysis (ET → Q) + Inflation ------------
+        X_a, ET_ens_f, Q_ens_f, diag = enkf_analysis_step(
+            X            = X,
+            P_t          = P_t,
+            PET_t        = PET_t,
+            params_cal   = params_cal,
+            Smax         = Smax_cal,
+            Gmax         = Gmax_cal,
+            rng          = rng,
+            cfg          = basin_cfg,
+            y_ET         = y_ET,
+            y_Q          = y_Q,
+            ET_override  = None,   # model computes ET from states internally
         )
 
-        ET_ass_mean[t] = np.nanmean(ET_ens_a)
-        Q_ass_mean[t]  = np.nanmean(Q_ens_a)
+        # Update running prior stats for next step's cap
+        prev_et_mean   = float(np.mean(ET_ens_f))
+        prev_et_spread = float(np.std(ET_ens_f, ddof=1))
 
-        # Continue with updated states
+        # ---- Re-forecast from posterior (zero perturbation) ------
+        _, ET_ens_a, Q_ens_a = enkf_forecast_step_states(
+            X            = X_a,
+            P_t          = P_t,
+            PET_t        = PET_t,
+            params_cal   = params_cal,
+            Smax         = Smax_cal,
+            Gmax         = Gmax_cal,
+            rng          = np.random.default_rng(),
+            proc_S_std   = 0.0,
+            proc_G_std   = 0.0,
+            P_std_frac   = 0.0,
+            PET_std_frac = 0.0,
+            ET_override  = None,
+        )
+
+        # ---- Store -----------------------------------------------
+        ET_ass_mean[t] = float(np.nanmean(ET_ens_a))
+        Q_ass_mean[t]  = float(np.nanmean(Q_ens_a))
+
+        ET_ens_hist[t, :] = ET_ens_a
+        Q_ens_hist[t, :]  = Q_ens_a
+        S_ens_hist[t, :]  = X_a[0, :]
+        G_ens_hist[t, :]  = X_a[1, :]
+
+        innov_ET_hist[t] = diag.innov_ET if diag.innov_ET is not None else np.nan
+        innov_Q_hist[t]  = diag.innov_Q  if diag.innov_Q  is not None else np.nan
+        spread_S_hist[t] = diag.spread_S
+        spread_G_hist[t] = diag.spread_G
+        spread_Q_hist[t] = diag.spread_Q
+
         X = X_a
-        S_ens_hist[t, :] = X[0, :]
-        G_ens_hist[t, :] = X[1, :]
 
-    enkf_hist = {
-        "time": np.arange(L),
-        "nens": nens,
-        "S_ens": S_ens_hist,
-        "G_ens": G_ens_hist,
-        "ET_ens": ET_ens_hist,   # prior ET ensemble (ET_model-driven)
-        "Q_ens": Q_ens_hist,     # prior Q ensemble
-    }
-
+    enkf_hist = dict(
+        nens      = nens,
+        S_ens     = S_ens_hist,
+        G_ens     = G_ens_hist,
+        ET_ens    = ET_ens_hist,
+        Q_ens     = Q_ens_hist,
+        innov_ET  = innov_ET_hist,
+        innov_Q   = innov_Q_hist,
+        spread_S  = spread_S_hist,
+        spread_G  = spread_G_hist,
+        spread_Q  = spread_Q_hist,
+    )
     return ET_ass_mean, Q_ass_mean, enkf_hist
 
 
-# ---------------------------------------------------------
-# Scenario normalization
-# ---------------------------------------------------------
-def normalize_scenario_key(s: str) -> str:
-    s = str(s).strip().upper()
+# =========================================================
+# ENSEMBLE OUTPUT — SAVE
+# =========================================================
 
-    mapping = {
-        "ALL": "ALL",
+def _save_enkf_ensemble(
+    enkf_hist: dict,
+    idx: pd.DatetimeIndex,
+    basin_id: str,
+    RESULT_DIR: str,
+) -> None:
+    nens = int(enkf_hist["nens"])
 
-        "BASE": "BASE",
-        "BASE_MODEL": "BASE",
-        "BASE-MODEL": "BASE",
+    def _summary(arr: np.ndarray, prefix: str) -> dict:
+        return {
+            f"{prefix}_mean": np.nanmean(arr, axis=1),
+            f"{prefix}_std":  np.nanstd(arr,  axis=1),
+            f"{prefix}_p05":  np.nanpercentile(arr,  5, axis=1),
+            f"{prefix}_p25":  np.nanpercentile(arr, 25, axis=1),
+            f"{prefix}_p50":  np.nanpercentile(arr, 50, axis=1),
+            f"{prefix}_p75":  np.nanpercentile(arr, 75, axis=1),
+            f"{prefix}_p95":  np.nanpercentile(arr, 95, axis=1),
+        }
 
-        "BUDYKO": "BUDYKO",
-        "BUDYKO_MODEL": "BUDYKO",
-        "BUDYKO-MODEL": "BUDYKO",
-
-        "BUDYKO_DA": "BUDYKO_DA",
-        "BUDYKO_DA_MODEL": "BUDYKO_DA",
-        "BUDYKO+DA": "BUDYKO_DA",
-        "DA": "BUDYKO_DA",
-        "ENKF": "BUDYKO_DA",
-        "ASSIMILATION": "BUDYKO_DA",
+    summary = {
+        "time": idx.values,
+        **_summary(enkf_hist["ET_ens"], "ET_ens"),
+        **_summary(enkf_hist["Q_ens"],  "Q_ens"),
+        **_summary(enkf_hist["S_ens"],  "S_ens"),
+        **_summary(enkf_hist["G_ens"],  "G_ens"),
+        "innov_ET":  enkf_hist["innov_ET"],
+        "innov_Q":   enkf_hist["innov_Q"],
+        "spread_S":  enkf_hist["spread_S"],
+        "spread_G":  enkf_hist["spread_G"],
+        "spread_Q":  enkf_hist["spread_Q"],
     }
+    member_cols = {
+        **{f"ET_ens_{i+1:03d}": enkf_hist["ET_ens"][:, i] for i in range(nens)},
+        **{f"Q_ens_{i+1:03d}":  enkf_hist["Q_ens"][:, i]  for i in range(nens)},
+    }
+    enkf_df = pd.concat(
+        [pd.DataFrame(summary), pd.DataFrame(member_cols)], axis=1
+    )
+    enkf_df.to_feather(
+        os.path.join(RESULT_DIR, f"enkf_ensemble_BUDYKO_DA_{basin_id}.feather")
+    )
 
-    if s not in mapping:
-        raise ValueError(f"Unknown scenario: {s}")
 
-    return mapping[s]
+# =========================================================
+# PER-BASIN SIMULATION
+# =========================================================
 
+def simulate_basin(
+    basin_id: str,
+    scenario: str,
+    RESULT_DIR: str,
+    da_cfg: dict,
+) -> dict | None:
 
-# ---------------------------------------------------------
-# Main simulation per basin (state-aware Budyko)
-# ---------------------------------------------------------
-def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg: dict):
-    common_cols = _GLOBAL["common_cols"]
-    if basin_id not in common_cols or basin_id not in _GLOBAL["calibrated_params"]:
+    common_cols       = _GLOBAL["common_cols"]
+    calibrated_params = _GLOBAL["calibrated_params"]
+    beta              = _GLOBAL["omega_mlr_beta"]
+    M_df              = _GLOBAL["M_df"]
+    Slp_df            = _GLOBAL["Slp_df"]
+    PET_df            = _GLOBAL["PET_df"]
+    Rainf_df          = _GLOBAL["Rainf_df"]
+    ET_sacsma_df      = _GLOBAL["ET_sacsma_df"]
+    Q_sacsma_df       = _GLOBAL["Q_sacsma_df"]
+    Q_usgs_df         = _GLOBAL["Q_usgs_df"]
+    idx               = _GLOBAL["idx"]
+
+    if basin_id not in common_cols or basin_id not in calibrated_params:
         return None
 
-    PET_df = _GLOBAL["PET_df"]
-    Rainf_df = _GLOBAL["Rainf_df"]
-    Evap_df = _GLOBAL["Evap_df"]
-    Q_usgs_df = _GLOBAL["Q_usgs_df"]
-    Q_nldas_df = _GLOBAL["Q_nldas_df"]
-    Qsb_df = _GLOBAL["Qsb_df"]
-    M_df = _GLOBAL["M_df"]
-    Slp_df = _GLOBAL["Slp_df"]
+    # ---- Forcings and SAC-SMA outputs ---------------------------
+    PET      = PET_df[basin_id].reindex(idx).to_numpy(dtype=float)
+    P        = Rainf_df[basin_id].reindex(idx).to_numpy(dtype=float)
+    ET_sacsma = ET_sacsma_df[basin_id].reindex(idx).to_numpy(dtype=float)
+    Q_sacsma  = Q_sacsma_df[basin_id].reindex(idx).to_numpy(dtype=float)
 
-    idx = Evap_df.index
-    L = len(idx)
+    Q_obs = pd.to_numeric(
+        Q_usgs_df.get(basin_id, pd.Series(np.nan, index=idx)).reindex(idx),
+        errors="coerce",
+    ).to_numpy(dtype=float)
 
-    p = _GLOBAL["calibrated_params"][basin_id]
+    # # ---- Omega MLR for Budyko scenario ---------------------------
+    # M_series  = M_df[basin_id].reindex(idx).to_numpy(dtype=float)
+    # slope_col = Slp_df[basin_id].reindex(idx)
+    # slope_val = (
+    #     float(slope_col.dropna().iloc[0]) if slope_col.notna().any() else np.nan
+    # )
+    # S_series  = np.full(len(idx), slope_val, dtype=float)
 
-    PET = PET_df[basin_id].reindex(idx).to_numpy().ravel()
-    P = Rainf_df[basin_id].reindex(idx).to_numpy().ravel()
-    Q_obs = Q_usgs_df.get(basin_id, pd.Series(index=idx)).reindex(idx).to_numpy().ravel()
-    Q_nldas = Q_nldas_df.get(basin_id, pd.Series(index=idx)).reindex(idx).to_numpy().ravel()  # kept (even if unused)
-    Qsb = Qsb_df.get(basin_id, pd.Series(index=idx)).reindex(idx).to_numpy().ravel()
+    # omega_mlr_raw    = beta[0] + beta[1] * M_series + beta[2] * S_series
+    # omega_mlr_series = np.clip(
+    #     np.where(np.isfinite(omega_mlr_raw), omega_mlr_raw, np.nan),
+    #     1.01, 50.0,
+    # )
 
-    # Model params
-    Smax_cal = float(p.get("Smax", 50.0))
+    # ---- Model parameters from calibrated_params.json -----------
+    p           = calibrated_params[basin_id]
+    Smax_cal    = float(p.get("Smax", 50.0))
     Gmax_factor = float(p.get("Gmax_factor", 4.0))
-    Gmax_cal = Smax_cal * Gmax_factor
-
-    S_init = float(p.get("S_init", 0.5 * Smax_cal))
-    G_init = float(p.get("G_init", 0.5 * Gmax_cal))
+    Gmax_cal    = Smax_cal * Gmax_factor
+    S_init      = float(p.get("S_init", 0.5 * Smax_cal))
+    G_init      = float(p.get("G_init", 0.5 * Gmax_cal))
 
     params_cal = ModelParams(
-        Smax=Smax_cal,
-        Kperc=p["Kperc"],
-        Kb=p["Kb"],
-        Ke=p["Ke"],
-        Cqq=p["Cqq"],
-        Sfc_frac=0.30,
-        beta_et=2.0,
+        Smax     = Smax_cal,
+        Kperc    = float(p["Kperc"]),
+        Kb       = float(p["Kb"]),
+        Ke       = float(p["Ke"]),
+        Cqq      = float(p["Cqq"]),
+        Sfc_frac = 0.30,
+        beta_et  = 2.0,
     )
 
-    ET_ke = PET * params_cal.Ke
-
-    # -----------------------------------------------------
-    # ✅ STATE-AWARE omega_true uses dS from BASE pass (ET_ke)
-    # -----------------------------------------------------
-    _Q_tmp, _S_tmp, _G_tmp, dS_tmp = run_model_deterministic(
-        P=P,
-        PET=PET,
-        params_cal=params_cal,
-        S_init=S_init,
-        G_init=G_init,
-        Gmax_cal=Gmax_cal,
-        ET_series=ET_ke,
+    # ---- dS from BASE run (needed for Budyko P_eff) -------------
+    # Drive the warm-up run with ET_sacsma to get a physically
+    # consistent dS series for computing P_eff = P - dS.
+    _, _, _, dS_tmp = run_model_deterministic(
+        P=P, PET=PET, params_cal=params_cal,
+        S_init=S_init, G_init=G_init, Gmax_cal=Gmax_cal,
+        ET_series=ET_sacsma,
     )
-    # print(np.nanmin(P - dS_tmp), np.nanpercentile(P - dS_tmp, [1, 5, 10]))
 
-    P_df_b = pd.DataFrame({basin_id: P}, index=idx)
-    dS_df_b = pd.DataFrame({basin_id: dS_tmp}, index=idx)
-    PET_df_b = pd.DataFrame({basin_id: PET}, index=idx)
-
-    # --- compute omega_true per basin (NO per-basin MLR fit) ---
-    budyko = BudykoModelEstimator(
-        P_df=P_df_b,
-        dS_df=dS_df_b,
-        PotEvap_df=PET_df_b,
-        M_basin=M_df[[basin_id]].reindex(idx),
-        Slope_basin=Slp_df[[basin_id]].reindex(idx),
-        calibrated_params=_GLOBAL["calibrated_params"],
-        Ke_df=None,
+    # ---- True omega (diagnostic, for BUDYKO scenario) -----------
+    # REPLACE the bud / omega_true / P_eff / ET_B block with this:
+    bud = BudykoModelEstimator(
+        P_df        = pd.DataFrame({basin_id: P},       index=idx),
+        dS_df       = pd.DataFrame({basin_id: dS_tmp},  index=idx),
+        PotEvap_df  = pd.DataFrame({basin_id: PET},     index=idx),
+        M_basin     = M_df[[basin_id]].reindex(idx),
+        Slope_basin = Slp_df[[basin_id]].reindex(idx),
+        calibrated_params = calibrated_params,
+        Ke_df       = None,
     )
-    omega_true_df = budyko.compute_omega_true()
-    omega_true_all = omega_true_df[basin_id].reindex(idx).to_numpy().ravel()
+    omega_true_series = bud.compute_omega_true()[basin_id].to_numpy(dtype=float)
+    omega_mlr_series  = bud.fit_and_compute_omega_mlr()[basin_id].to_numpy(dtype=float)
+    ET_B              = bud.estimate_budyko_et()[basin_id].to_numpy(dtype=float)
+    # FIX 1 already applied inside BudykoModelEstimator._compute_peff — no need to redo it here
 
-    # -----------------------------------------------------
-    # ✅ APPLY GLOBAL omega_MLR (beta from all basins)
-    # -----------------------------------------------------
-    beta = _GLOBAL.get("omega_mlr_beta", None)
-    if beta is None or len(beta) != 3 or not np.all(np.isfinite(beta)):
-        raise ValueError("Global omega_mlr_beta is missing/invalid. Fit it once in run_simulations_from_config().")
+    enkf_hist: dict | None = None
 
-    M_series = M_df[basin_id].reindex(idx).to_numpy().ravel().astype(float)
-
-    slope_val = np.nan
-    if basin_id in Slp_df.columns:
-        slope_val = Slp_df[basin_id].iloc[0]
-    slope_val = float(slope_val) if np.isfinite(slope_val) else np.nan
-
-    omega_MLR_all = beta[0] + beta[1] * M_series + beta[2] * slope_val
-    omega_MLR_all = np.clip(omega_MLR_all, 1.0, 50.0)
-
-    # -----------------------------------------------------
-    # Compute ET_B using Fu with omega_MLR and P_eff = P - dS_tmp
-    # -----------------------------------------------------
-    P_eff = (P - dS_tmp).astype(float)
-    ET_B = fu_et_from_peff(P_eff=P_eff, PET=PET, omega=omega_MLR_all)
-
-    # -----------------------------------------------------
-    # Run scenarios
-    # -----------------------------------------------------
-    enkf_hist = None
-    ET_ass_mean = np.full(L, np.nan)
-    Q_ass_mean = np.full(L, np.nan)
-
+    # =============================================================
+    # BASE — two-store driven by ET_sacsma
+    # =============================================================
     if scenario == "BASE":
         Q_base, S_base, G_base, dS_base = run_model_deterministic(
-            P=P,
-            PET=PET,
-            params_cal=params_cal,
-            S_init=S_init,
-            G_init=G_init,
-            Gmax_cal=Gmax_cal,
-            ET_series=ET_ke,
+            P=P, PET=PET, params_cal=params_cal,
+            S_init=S_init, G_init=G_init, Gmax_cal=Gmax_cal,
+            ET_series=ET_sacsma,        # SAC-SMA ET as forcing
         )
-
         results = pd.DataFrame({
-            "time": idx,
-            "P": P,
-            "PET": PET,
-            "ET_ke": ET_ke,
-            "dS_base": dS_base,
-            "Q_bs": Qsb,
-            "Q_obs": Q_obs,
-            "Q_base": Q_base,
-            "S_base": S_base,
-            "G_base": G_base
+            "time":        idx,
+            "P":           P,
+            "PET":         PET,
+            "ET_ke":   ET_sacsma,
+            "Q_sacsma":    Q_sacsma,
+            "omega_true":  omega_true_series,
+            "omega_MLR":   omega_mlr_series,
+            "dS_base":     dS_base,
+            "Q_obs":       Q_obs,
+            "Q_base":      Q_base,
+            "S_base":      S_base,
+            "G_base":      G_base,
         }).set_index("time")
+        qsim_name = "Q_base"
 
+    # =============================================================
+    # BUDYKO — two-store driven by ET_B (Fu–Budyko)
+    # =============================================================
     elif scenario == "BUDYKO":
         Q_budyko, S_budyko, G_budyko, dS_budyko = run_model_deterministic(
-            P=P,
-            PET=PET,
-            params_cal=params_cal,
-            S_init=S_init,
-            G_init=G_init,
-            Gmax_cal=Gmax_cal,
-            ET_series=ET_B,
+            P=P, PET=PET, params_cal=params_cal,
+            S_init=S_init, G_init=G_init, Gmax_cal=Gmax_cal,
+            ET_series=ET_B,             # Budyko ET as forcing
         )
-
         results = pd.DataFrame({
-            "time": idx,
-            "omega_true": omega_true_all,
-            "omega_MLR": omega_MLR_all,
-            "P": P,
-            "PET": PET,
-            "ET_B": ET_B,
-            "dS_budyko": dS_budyko,
-            "Q_obs": Q_obs,
-            "Q_budyko": Q_budyko,
-            "S_budyko": S_budyko,
-            "G_budyko": G_budyko,
+            "time":        idx,
+            "P":           P,
+            "PET":         PET,
+            "ET_ke":   ET_sacsma,
+            "ET_B":        ET_B,
+            "Q_sacsma":    Q_sacsma,
+            "omega_true":  omega_true_series,
+            "omega_MLR":   omega_mlr_series,
+            "dS_budyko":   dS_budyko,
+            "Q_obs":       Q_obs,
+            "Q_budyko":    Q_budyko,
+            "S_budyko":    S_budyko,
+            "G_budyko":    G_budyko,
         }).set_index("time")
+        qsim_name = "Q_budyko"
 
+    # =============================================================
+    # BUDYKO_DA — assimilate ET_sacsma into [S, G]
+    # =============================================================
     elif scenario == "BUDYKO_DA":
         config = EnKFConfig(**da_cfg)
 
         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
-            P=P,
-            PET=PET,
-            ET_obs=ET_B,     # truth (state-aware Budyko ET)
-            ET_model=ET_ke,  # model
-            params_cal=params_cal,
-            S_init=S_init,
-            G_init=G_init,
-            Smax_cal=Smax_cal,
-            Gmax_cal=Gmax_cal,
-            config=config,
-            basin_id=basin_id,
+            P          = P,
+            PET        = PET,
+            ET_obs     = ET_sacsma,     # ET_sacsma is the assimilation observation
+            params_cal = params_cal,
+            S_init     = S_init,
+            G_init     = G_init,
+            Smax_cal   = Smax_cal,
+            Gmax_cal   = Gmax_cal,
+            config     = config,
+            basin_id   = basin_id,
+            Q_obs      = Q_obs,         # NaN-safe; skipped if all NaN
         )
 
-        Q_ass, S_ass, G_ass, dS_ass = run_model_deterministic(
-            P=P,
-            PET=PET,
-            params_cal=params_cal,
-            S_init=S_init,
-            G_init=G_init,
-            Gmax_cal=Gmax_cal,
-            ET_series=ET_ass_mean,
-        )
+        S_ass  = np.nanmean(enkf_hist["S_ens"], axis=1)
+        G_ass  = np.nanmean(enkf_hist["G_ens"], axis=1)
+        dS_ass = np.concatenate([[np.nan], np.diff(S_ass + G_ass)])
 
         results = pd.DataFrame({
-            "time": idx,
-            "P": P,
-            "PET": PET,
-            "ET_B": ET_B,
-            "ET_ass": ET_ass_mean,
-            "dS_ass": dS_ass,
-            "Q_obs": Q_obs,
-            "Q_ass": Q_ass,
-            "Q_ens": Q_ass_mean,
+            "time":        idx,
+            "P":           P,
+            "PET":         PET,
+            "ET_ke":       ET_sacsma,   # observation that was assimilated
+            "ET_B":        ET_B,        # Budyko ET (diagnostic)
+            "ET_ass":      ET_ass_mean, # posterior ET from re-forecast
+            "Q_sacsma":    Q_sacsma,    # SAC-SMA reference
+            "omega_true":  omega_true_series,
+            "omega_MLR":   omega_mlr_series,
+            "dS_ass":      dS_ass,
+            "Q_obs":       Q_obs,
+            "Q_ass":       Q_ass_mean,
+            "S_ass":       S_ass,
+            "G_ass":       G_ass,
         }).set_index("time")
 
+        _save_enkf_ensemble(enkf_hist, idx, basin_id, RESULT_DIR)
+        qsim_name = "Q_ass"
+
     else:
-        raise ValueError(f"Unknown scenario: {scenario}")
+        raise ValueError(f"Unknown scenario: {scenario!r}")
 
-    # Save results
-    result_path = os.path.join(RESULT_DIR, f"results_{scenario}_{basin_id}.feather")
-    results.reset_index().to_feather(result_path)
+    # ---- Save main results feather -------------------------------
+    results.reset_index().to_feather(
+        os.path.join(RESULT_DIR, f"results_{scenario}_{basin_id}.feather")
+    )
 
-    if scenario == "BUDYKO_DA" and enkf_hist is not None:
-        enkf_df = pd.DataFrame({
-            "time": idx,
-            "ET_ens_mean": np.nanmean(enkf_hist["ET_ens"], axis=1),
-            "Q_ens_mean": np.nanmean(enkf_hist["Q_ens"], axis=1),
-            "S_ens_mean": np.nanmean(enkf_hist["S_ens"], axis=1),
-            "G_ens_mean": np.nanmean(enkf_hist["G_ens"], axis=1),
-        })
+    # ---- Metrics against Q_USGS ----------------------------------
+    qobs = results["Q_obs"].to_numpy(dtype=float)
+    qsim = results[qsim_name].to_numpy(dtype=float)
 
-        enkf_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.feather")
-        enkf_df.to_feather(enkf_path)
-
-    # Metrics
-    qobs = results["Q_obs"].values if "Q_obs" in results.columns else Q_obs
-
-    qcol = [c for c in results.columns if c.startswith("Q_") and c != "Q_obs"]
-    qsim_name = qcol[-1] if qcol else None
-    qsim = results[qsim_name].values if qsim_name else None
-
-    metrics = {
+    return {
         "gauge_id": basin_id,
         "scenario": scenario,
-        "KGE": calculate_kge(qobs, qsim) if qsim is not None else np.nan,
-        "NSE": calculate_nse(qobs, qsim) if qsim is not None else np.nan,
+        "KGE": float(calculate_kge(qobs, qsim)),
+        "NSE": float(calculate_nse(qobs, qsim)),
     }
 
-    return metrics
 
+# =========================================================
+# MAIN ENTRY POINT
+# =========================================================
 
-# ---------------------------------------------------------
-# Run from config
-# ---------------------------------------------------------
-def run_simulations_from_config(cfg: dict):
+def run_simulations_from_config(cfg: dict) -> None:
 
-    scenario = normalize_scenario_key(cfg["scenario"])
-    if scenario == "ALL":
-        scenarios_to_run = ["BASE", "BUDYKO", "BUDYKO_DA"]
-    else:
-        scenarios_to_run = [scenario]
+    scenario         = normalize_scenario_key(cfg["scenario"])
+    scenarios_to_run = (
+        ["BASE", "BUDYKO", "BUDYKO_DA"] if scenario == "ALL" else [scenario]
+    )
 
-    paths = cfg["paths"]
-    DATA_DIR = os.path.join(PROJECT_ROOT, paths["data_dir"])
-
+    paths           = cfg["paths"]
+    DATA_DIR        = os.path.join(PROJECT_ROOT, paths["data_dir"])
     BASE_RESULT_DIR = os.path.join(PROJECT_ROOT, paths["result_dir"])
     os.makedirs(BASE_RESULT_DIR, exist_ok=True)
 
-    # calibrated params
-    cal_path = os.path.join(PROJECT_ROOT, paths["calibrated_params"])
-    with open(cal_path, "r") as f:
+    with open(os.path.join(PROJECT_ROOT, paths["calibrated_params"])) as f:
         calibrated_params = json.load(f)
 
-    da_cfg = cfg.get("da", {})
-    if "enabled" in da_cfg:
-        da_cfg.pop("enabled")
+    # Strip "enabled" — config-level flag, not an EnKFConfig field
+    da_cfg = {k: v for k, v in cfg.get("da", {}).items() if k != "enabled"}
 
     basin_subset = cfg.get("basins", {}).get("subset", None)
+    inputs       = load_all_inputs(DATA_DIR)
 
-    # -----------------------------------------------------
-    # LOAD ALL INPUTS ONCE (NO global/offline Budyko)
-    # -----------------------------------------------------
-    inputs = load_all_inputs(DATA_DIR)
-
-    # Determine basins
-    if basin_subset is None:
-        basins = list(inputs["Evap_df"].columns)
-    else:
-        basins = list(basin_subset)
-
-    # Filter basins to those present in common_cols AND calibrated_params
-    common_cols = inputs["common_cols"]
-    basins = [b for b in basins if (b in common_cols and b in calibrated_params)]
-
-    # -----------------------------------------------------
-    # ✅ FIT GLOBAL omega_MLR ONCE (across ALL basins)
-    # -----------------------------------------------------
-    idx = inputs["Evap_df"].index
-    beta = fit_global_omega_mlr(
-        basins=basins,
-        idx=idx,
-        PET_df=inputs["PET_df"],
-        Rainf_df=inputs["Rainf_df"],
-        M_df=inputs["M_df"],
-        Slp_df=inputs["Slp_df"],
-        calibrated_params=calibrated_params,
+    basins = (
+        list(basin_subset) if basin_subset is not None
+        else list(inputs["Q_sacsma_df"].columns)
     )
+    common_cols = inputs["common_cols"]
+    basins = [b for b in basins if b in common_cols and b in calibrated_params]
 
-    # Prepare global payload (shipped once per worker)
+    if not basins:
+        raise ValueError(
+            "No basins remain after filtering by common_cols and calibrated_params. "
+            "Check that basin IDs in calibrated_params.json match feather column names."
+        )
+
+    idx  = inputs["idx"]
+
+    print(f"\nFitting global omega MLR across {len(basins)} basins ...")
+    beta = fit_global_omega_mlr(
+        basins       = basins,
+        idx          = idx,
+        PET_df       = inputs["PET_df"],
+        Rainf_df     = inputs["Rainf_df"],
+        ET_sacsma_df = inputs["ET_sacsma_df"],
+        M_df         = inputs["M_df"],
+        Slp_df       = inputs["Slp_df"],
+        calibrated_params = calibrated_params,
+    )
+    print(f"  beta = {beta}")
+
     global_payload = {
-        "PET_df": inputs["PET_df"],
-        "Rainf_df": inputs["Rainf_df"],
-        "Evap_df": inputs["Evap_df"],
-        "Q_usgs_df": inputs["Q_usgs_df"],
-        "Q_nldas_df": inputs["Q_nldas_df"],
-        "Qsb_df": inputs["Qsb_df"],
-        "M_df": inputs["M_df"],
-        "RootMoist_df": inputs["RootMoist_df"],
-        "Slp_df": inputs["Slp_df"],
-        "common_cols": common_cols,
-        "calibrated_params": calibrated_params,
-        "omega_mlr_beta": beta,  # ✅ NEW
+        **inputs,
+        "calibrated_params": calibrated_params
+        # "omega_mlr_beta":    None,
     }
-
-    # Set globals for serial mode (this process)
     _init_worker(global_payload)
 
-    # parallel settings
-    par_cfg = cfg.get("parallel", {})
+    par_cfg     = cfg.get("parallel", {})
     par_enabled = bool(par_cfg.get("enabled", True))
     max_workers = int(par_cfg.get("max_workers", -1))
-    if max_workers == -1:
+    if max_workers <= 0:
         max_workers = max(1, cpu_count() - 1)
 
-    # -----------------------------------------------------
-    # RUN EACH SCENARIO
-    # -----------------------------------------------------
-    for scenario in scenarios_to_run:
-
-        scenario_dir = scenario_folder_name(scenario)
-        RESULT_DIR = os.path.join(BASE_RESULT_DIR, scenario_dir)
+    for sc in scenarios_to_run:
+        RESULT_DIR = os.path.join(BASE_RESULT_DIR, scenario_folder_name(sc))
         os.makedirs(RESULT_DIR, exist_ok=True)
-
-        all_metrics = []
+        all_metrics: list[dict] = []
 
         if par_enabled:
             with ProcessPoolExecutor(
@@ -838,1380 +968,35 @@ def run_simulations_from_config(cfg: dict):
                 initargs=(global_payload,),
             ) as executor:
                 futures = {
-                    executor.submit(
-                        simulate_basin, b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg
-                    ): b
+                    executor.submit(simulate_basin, b, sc, RESULT_DIR, da_cfg): b
                     for b in basins
                 }
-
-                for f in tqdm(as_completed(futures), total=len(futures), desc=f"Running scenario={scenario}"):
-                    out = f.result()
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Running scenario={sc}",
+                ):
+                    try:
+                        out = future.result()
+                        if out is not None:
+                            all_metrics.append(out)
+                    except Exception as exc:
+                        logging.error(
+                            f"Basin {futures[future]!r} failed: {exc}",
+                            exc_info=True,
+                        )
+        else:
+            for b in tqdm(basins, desc=f"Running scenario={sc}"):
+                try:
+                    out = simulate_basin(b, sc, RESULT_DIR, da_cfg)
                     if out is not None:
                         all_metrics.append(out)
-        else:
-            for b in tqdm(basins, desc=f"Running scenario={scenario}"):
-                out = simulate_basin(b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg)
-                if out is not None:
-                    all_metrics.append(out)
+                except Exception as exc:
+                    logging.error(f"Basin {b!r} failed: {exc}", exc_info=True)
 
         pd.DataFrame(all_metrics).to_csv(
-            os.path.join(RESULT_DIR, f"metrics_{scenario}.csv"),
-            index=False
+            os.path.join(RESULT_DIR, f"metrics_{sc}.csv"), index=False,
         )
-
-        print(f"\n✅ Completed successfully: scenario={scenario}. Results saved to {RESULT_DIR}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # scripts/run_simulation.py
-# import os
-# import sys
-# import json
-# import logging
-# from concurrent.futures import ProcessPoolExecutor, as_completed
-# from multiprocessing import cpu_count
-
-# import numpy as np
-# import pandas as pd
-# from tqdm import tqdm
-
-# PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# if PROJECT_ROOT not in sys.path:
-#     sys.path.insert(0, PROJECT_ROOT)
-
-# # ✅ DO NOT import anything from run.py (avoids circular import)
-
-# from src.model import ModelParams, two_store_model_step
-# from src.budyko import BudykoModelEstimator
-# from src.enkf import EnKFConfig, enkf_update_stochastic_scalar, enkf_forecast_step_states
-# from src.metrics import calculate_kge, calculate_nse
-
-
-# # =========================================================
-# # GLOBALS 
-# # =========================================================
-# _GLOBAL = {
-#     "PET_df": None,
-#     "Rainf_df": None,
-#     "Evap_df": None,
-#     "Q_usgs_df": None,
-#     "Q_nldas_df": None,
-#     "Qsb_df": None,
-#     "M_df": None,
-#     "RootMoist_df": None,
-#     "Slp_df": None,
-#     "common_cols": None,
-#     "ET_B_df": None,
-#     "omega_true_df": None,
-#     "omega_MLR_df": None,
-#     "calibrated_params": None,
-# }
-
-
-# def scenario_folder_name(scenario: str) -> str:
-#     s = str(scenario).strip().upper()
-
-#     if s == "BASE":
-#         return "BASE_MODEL"
-#     elif s == "BUDYKO":
-#         return "BUDYKO_MODEL"
-#     elif s in ["BUDYKO_DA", "BUDYKO+DA", "DA", "ENKF"]:
-#         return "BUDYKO_DA"
-#     else:
-#         return f"{s}_SCENARIO"
-
-
-# # ---------------------------------------------------------
-# # Feather loader
-# # ---------------------------------------------------------
-# def load_feather_df(fname: str, ddir: str) -> pd.DataFrame:
-#     path = os.path.join(ddir, fname)
-#     if not os.path.exists(path):
-#         logging.warning(f"File not found: {path}. Returning empty DataFrame.")
-#         return pd.DataFrame()
-
-#     df = pd.read_feather(path).dropna(axis=1, how="all")
-
-#     if "time" in df.columns:
-#         df["time"] = pd.to_datetime(df["time"])
-#         df.set_index("time", inplace=True)
-
-#     return df
-
-
-# # ---------------------------------------------------------
-# # Load all inputs once
-# # ---------------------------------------------------------
-# def load_all_inputs(DATA_DIR: str) -> dict:
-#     PET_df = load_feather_df("PotEvap.feather", DATA_DIR)
-#     Rainf_df = load_feather_df("Rainf.feather", DATA_DIR)
-#     Evap_df = load_feather_df("EVap.feather", DATA_DIR)
-#     Q_usgs_df = load_feather_df("Q_USGS.feather", DATA_DIR)
-#     Q_nldas_df = load_feather_df("Q_nldas_mm_monthly.feather", DATA_DIR)
-#     Qsb_df = load_feather_df("Qsb.feather", DATA_DIR)
-#     M_df = load_feather_df("M.feather", DATA_DIR)
-#     RootMoist_df = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
-#     Slp_df = load_feather_df("slope.feather", DATA_DIR)
-
-#     # Same intersection logic you had
-#     common_cols = sorted(
-#         set(Evap_df.columns)
-#         & set(Qsb_df.columns)
-#         & set(PET_df.columns)
-#         & set(M_df.columns)
-#         & set(RootMoist_df.columns)
-#         & set(Slp_df.columns)
-#     )
-
-#     # Restrict to common columns (like your code)
-#     if len(common_cols) > 0:
-#         Evap_df = Evap_df[common_cols]
-#         Qsb_df = Qsb_df[common_cols]
-#         PET_df = PET_df[common_cols]
-#         M_df = M_df[common_cols]
-#         RootMoist_df = RootMoist_df[common_cols]
-#         Slp_df = Slp_df[common_cols]
-
-#     return {
-#         "PET_df": PET_df,
-#         "Rainf_df": Rainf_df,
-#         "Evap_df": Evap_df,
-#         "Q_usgs_df": Q_usgs_df,
-#         "Q_nldas_df": Q_nldas_df,
-#         "Qsb_df": Qsb_df,
-#         "M_df": M_df,
-#         "RootMoist_df": RootMoist_df,
-#         "Slp_df": Slp_df,
-#         "common_cols": common_cols,
-#     }
-
-
-# # ---------------------------------------------------------
-# # Compute Budyko once for ALL basins
-# # ---------------------------------------------------------
-# def compute_budyko_once(inputs: dict, calibrated_params: dict) -> dict:
-#     Evap_df = inputs["Evap_df"]
-#     Qsb_df = inputs["Qsb_df"]
-#     PET_df = inputs["PET_df"]
-#     RootMoist_df = inputs["RootMoist_df"]
-#     M_df = inputs["M_df"]
-#     Slp_df = inputs["Slp_df"]
-#     common_cols = inputs["common_cols"]
-
-#     if Evap_df is None or len(common_cols) == 0:
-#         return {
-#             "ET_B_df": pd.DataFrame(index=getattr(Evap_df, "index", None)),
-#             "omega_true_df": pd.DataFrame(index=getattr(Evap_df, "index", None)),
-#             "omega_MLR_df": pd.DataFrame(index=getattr(Evap_df, "index", None)),
-#         }
-
-#     # IMPORTANT: keep the same arguments you were using to avoid changing results
-#     budyko = BudykoModelEstimator(
-#         Evap_df=Evap_df[common_cols],
-#         Qsb_monthly=Qsb_df[common_cols],
-#         PotEvap_df=PET_df[common_cols],
-#         M_basin=M_df[common_cols],
-#         Slope_basin=Slp_df[common_cols],  
-#         calibrated_params=calibrated_params,
-#     )
-
-#     budyko.estimate_budyko_et()
-
-#     # These are expected to be DataFrames (basins as columns)
-#     ET_B_df = budyko.ET_B.reindex(Evap_df.index)
-#     omega_true_df = budyko.omega_true.reindex(Evap_df.index)
-#     omega_MLR_df = budyko.omega_MLR.reindex(Evap_df.index)
-
-#     return {
-#         "ET_B_df": ET_B_df,
-#         "omega_true_df": omega_true_df,
-#         "omega_MLR_df": omega_MLR_df,
-#     }
-
-
-# # ---------------------------------------------------------
-# # Worker initializer (sets globals once per worker)
-# # ---------------------------------------------------------
-# def _init_worker(global_payload: dict):
-#     _GLOBAL.update(global_payload)
-
-
-# # ---------------------------------------------------------
-# # Deterministic single-run model
-# # ---------------------------------------------------------
-# def run_model_deterministic(
-#     P: np.ndarray,
-#     PET: np.ndarray,
-#     params_cal: ModelParams,
-#     S_init: float,
-#     G_init: float,
-#     Gmax_cal: float,
-#     ET_series: np.ndarray,
-# ):
-#     L = len(P)
-#     S, G = float(S_init), float(G_init)
-
-#     Q_out, S_out, G_out = np.full(L, np.nan), np.full(L, np.nan), np.full(L, np.nan)
-
-#     for t in range(L):
-#         P_t = float(P[t]) if np.isfinite(P[t]) else 0.0
-#         PET_t = float(PET[t]) if np.isfinite(PET[t]) else 0.0
-
-#         S, G, _, Q, *_ = two_store_model_step(
-#             S,
-#             G,
-#             P_t,
-#             PET_t,
-#             params_cal,
-#             ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None,
-#         )
-
-#         G = np.clip(G, 0.0, Gmax_cal)
-
-#         Q_out[t] = max(Q, 0.0)
-#         S_out[t] = S
-#         G_out[t] = G
-
-#     return Q_out, S_out, G_out
-
-
-# # ---------------------------------------------------------
-# # DA run (EnKF) -> assimilates ET_model toward ET_obs
-# # produces ET_ass_mean (posterior) and Q_ass_mean
-# # ---------------------------------------------------------
-# def run_budyko_da(
-#     P: np.ndarray,
-#     PET: np.ndarray,
-#     ET_obs: np.ndarray,     # truth (e.g., ET_B)
-#     ET_model: np.ndarray,   # model (e.g., ET_ke)
-#     params_cal: ModelParams,
-#     S_init: float,
-#     G_init: float,
-#     Smax_cal: float,
-#     Gmax_cal: float,
-#     config: EnKFConfig,
-#     basin_id: str,
-# ):
-#     L = len(P)
-#     nens = int(config.nens)
-#     inflation = float(config.inflation)
-#     R_ET_var = float(config.R_ET_std) ** 2
-
-#     rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
-
-#     # Initial ensemble states [S,G]
-#     S0_ens = np.clip(
-#         S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens),
-#         0.0, Smax_cal
-#     )
-#     G0_ens = np.clip(
-#         G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens),
-#         0.0, Gmax_cal
-#     )
-#     X = np.vstack([S0_ens, G0_ens])  # shape = (2, nens)
-
-#     # Save ensemble histories
-#     S_ens_hist  = np.full((L, nens), np.nan)
-#     G_ens_hist  = np.full((L, nens), np.nan)
-#     ET_ens_hist = np.full((L, nens), np.nan)
-#     Q_ens_hist  = np.full((L, nens), np.nan)
-
-#     # mean time series (posterior)
-#     ET_ass_mean = np.full(L, np.nan)
-#     Q_ass_mean  = np.full(L, np.nan)
-
-#     for t in range(L):
-
-#         # Forecast: ET is forced to ET_model[t] (ET_ke)
-#         ET_override_t = float(ET_model[t]) if np.isfinite(ET_model[t]) else None
-
-#         X_f, ET_ens_f, Q_ens_f = enkf_forecast_step_states(
-#             X=X,
-#             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-#             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-#             params_cal=params_cal,
-#             Smax=Smax_cal,
-#             Gmax=Gmax_cal,
-#             rng=rng,
-
-#             proc_S_std=float(config.proc_S_std),
-#             proc_G_std=float(config.proc_G_std),
-#             P_std_frac=float(config.P_std_frac),
-#             PET_std_frac=float(config.PET_std_frac),
-#             ET_override=ET_override_t,
-#         )
-
-#         # Save prior (forecast) ET/Q
-#         ET_ens_hist[t, :] = ET_ens_f
-#         Q_ens_hist[t, :]  = Q_ens_f
-
-#         # Analysis: assimilate ET_obs[t] (ET_B) into state
-#         if np.isfinite(ET_obs[t]):
-#             X_a = enkf_update_stochastic_scalar(
-#                 X=X_f,
-#                 y_obs=float(ET_obs[t]),
-#                 HX=ET_ens_f.copy(),
-#                 R_var=R_ET_var,
-#                 inflation=inflation,
-#                 Smax=Smax_cal,
-#                 Gmax=Gmax_cal,
-#                 rng=rng,
-#             )
-#         else:
-#             X_a = X_f
-
-#         # Posterior: recompute ET/Q from updated states (no extra noise)
-#         _, ET_ens_a, Q_ens_a = enkf_forecast_step_states(
-#             X=X_a,
-#             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-#             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-#             params_cal=params_cal,
-#             Smax=Smax_cal,
-#             Gmax=Gmax_cal,
-#             rng=rng,
-
-#             proc_S_std=0.0,
-#             proc_G_std=0.0,
-#             P_std_frac=0.0,
-#             PET_std_frac=0.0,
-
-#             ET_override=ET_override_t,
-#         )
-
-#         ET_ass_mean[t] = np.nanmean(ET_ens_a)
-#         Q_ass_mean[t]  = np.nanmean(Q_ens_a)
-
-#         # Continue with updated states
-#         X = X_a
-#         S_ens_hist[t, :] = X[0, :]
-#         G_ens_hist[t, :] = X[1, :]
-
-#     enkf_hist = {
-#         "time": np.arange(L),
-#         "nens": nens,
-#         "S_ens": S_ens_hist,
-#         "G_ens": G_ens_hist,
-#         "ET_ens": ET_ens_hist,   # prior ET ensemble (ET_model-driven)
-#         "Q_ens": Q_ens_hist,     # prior Q ensemble
-#     }
-
-#     return ET_ass_mean, Q_ass_mean, enkf_hist
-
-
-# # ---------------------------------------------------------
-# # Scenario normalization
-# # ---------------------------------------------------------
-# def normalize_scenario_key(s: str) -> str:
-#     s = str(s).strip().upper()
-
-#     mapping = {
-#         "ALL": "ALL",
-
-#         "BASE": "BASE",
-#         "BASE_MODEL": "BASE",
-#         "BASE-MODEL": "BASE",
-
-#         "BUDYKO": "BUDYKO",
-#         "BUDYKO_MODEL": "BUDYKO",
-#         "BUDYKO-MODEL": "BUDYKO",
-
-#         "BUDYKO_DA": "BUDYKO_DA",
-#         "BUDYKO_DA_MODEL": "BUDYKO_DA",
-#         "BUDYKO+DA": "BUDYKO_DA",
-#         "DA": "BUDYKO_DA",
-#         "ENKF": "BUDYKO_DA",
-#         "ASSIMILATION": "BUDYKO_DA",
-#     }
-
-#     if s not in mapping:
-#         raise ValueError(f"Unknown scenario: {s}")
-
-#     return mapping[s]
-
-
-# # ---------------------------------------------------------
-# # Main simulation per basin
-# # ---------------------------------------------------------
-# def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg: dict):
-#     # NOTE: DATA_DIR and calibrated_params are kept in signature to avoid changing your call sites,
-#     # but we use the preloaded globals for speed.
-
-#     common_cols = _GLOBAL["common_cols"]
-#     if basin_id not in common_cols or basin_id not in _GLOBAL["calibrated_params"]:
-#         return None
-
-#     PET_df = _GLOBAL["PET_df"]
-#     Rainf_df = _GLOBAL["Rainf_df"]
-#     Evap_df = _GLOBAL["Evap_df"]
-#     Q_usgs_df = _GLOBAL["Q_usgs_df"]
-#     Q_nldas_df = _GLOBAL["Q_nldas_df"]
-#     Qsb_df = _GLOBAL["Qsb_df"]
-
-#     # Budyko outputs (precomputed once)
-#     ET_B_df = _GLOBAL["ET_B_df"]
-#     omega_true_df = _GLOBAL["omega_true_df"]
-#     omega_MLR_df = _GLOBAL["omega_MLR_df"]
-
-#     idx = Evap_df.index
-#     L = len(idx)
-
-#     p = _GLOBAL["calibrated_params"][basin_id]
-
-#     PET = PET_df[basin_id].values
-#     P = Rainf_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
-#     Q_obs = Q_usgs_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
-#     Q_nldas = Q_nldas_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values  # kept (even if unused)
-#     Qsb = Qsb_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
-
-#     # Budyko series for this basin (already computed)
-#     omega_true_all = omega_true_df[basin_id].reindex(idx).to_numpy().ravel()
-#     omega_MLR_all  = omega_MLR_df[basin_id].reindex(idx).to_numpy().ravel()
-#     ET_B           = ET_B_df[basin_id].reindex(idx).to_numpy().ravel()
-
-#     # Model params
-#     Smax_cal = float(p.get("Smax", 50.0))
-#     Gmax_factor = float(p.get("Gmax_factor", 4.0))
-#     Gmax_cal = Smax_cal * Gmax_factor
-
-#     S_init = float(p.get("S_init", 0.5 * Smax_cal))
-#     G_init = float(p.get("G_init", 0.5 * Gmax_cal))
-
-#     params_cal = ModelParams(
-#         Smax=Smax_cal,
-#         Kperc=p["Kperc"],
-#         Kb=p["Kb"],
-#         Ke=p["Ke"],
-#         Cqq=p["Cqq"],
-#         Sfc_frac=0.30,
-#         beta_et=2.0,
-#     )
-
-#     ET_ke = PET * params_cal.Ke
-
-#     enkf_hist = None  # NO DA
-#     ET_ass_mean = np.full(L, np.nan)
-#     Q_ass_mean = np.full(L, np.nan)
-
-#     if scenario == "BASE":
-#         Q_base, S_base, G_base = run_model_deterministic(
-#             P=P,
-#             PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_ke,
-#         )
-
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "P": P,
-#             "PET": PET,
-#             "ET_ke": ET_ke,
-#             "Q_bs": Qsb,
-#             "Q_obs": Q_obs,
-#             "Q_base": Q_base,
-#             "S_base": S_base,
-#             "G_base": G_base
-#         }).set_index("time")
-
-#     elif scenario == "BUDYKO":
-#         Q_budyko, S_budyko, G_budyko = run_model_deterministic(
-#             P=P,
-#             PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_B,
-#         )
-
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "omega_true": omega_true_all,
-#             "omega_MLR": omega_MLR_all,
-#             "P": P,
-#             "PET": PET,
-#             "ET_B": ET_B,
-#             "Q_obs": Q_obs,
-#             "Q_budyko": Q_budyko,
-#             "S_budyko": S_budyko,
-#             "G_budyko": G_budyko,
-#         }).set_index("time")
-
-#     elif scenario == "BUDYKO_DA":
-#         config = EnKFConfig(**da_cfg)
-
-#         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
-#             P=P,
-#             PET=PET,
-#             ET_obs=ET_B,     # truth
-#             ET_model=ET_ke,  # model
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Smax_cal=Smax_cal,
-#             Gmax_cal=Gmax_cal,
-#             config=config,
-#             basin_id=basin_id,
-#         )
-
-#         Q_ass, S_ass, G_ass = run_model_deterministic(
-#             P=P,
-#             PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_ass_mean,
-#         )
-
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "P": P,
-#             "PET": PET,
-#             "ET_B": ET_B,
-#             "ET_ass": ET_ass_mean,
-#             "Q_obs": Q_obs,
-#             "Q_ass": Q_ass,
-#             "Q_ens": Q_ass_mean,
-#         }).set_index("time")
-
-#     else:
-#         raise ValueError(f"Unknown scenario: {scenario}")
-
-#     # Save results
-#     result_path = os.path.join(RESULT_DIR, f"results_{scenario}_{basin_id}.feather")
-#     results.reset_index().to_feather(result_path)
-
-#     if scenario == "BUDYKO_DA" and enkf_hist is not None:
-#         enkf_df = pd.DataFrame({
-#             "time": idx,
-#             "ET_ens_mean": np.nanmean(enkf_hist["ET_ens"], axis=1),
-#             "Q_ens_mean": np.nanmean(enkf_hist["Q_ens"], axis=1),
-#             "S_ens_mean": np.nanmean(enkf_hist["S_ens"], axis=1),
-#             "G_ens_mean": np.nanmean(enkf_hist["G_ens"], axis=1),
-#         })
-
-#         enkf_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.feather")
-#         enkf_df.to_feather(enkf_path)
-
-#     # Metrics
-#     qobs = results["Q_obs"].values if "Q_obs" in results.columns else Q_obs
-
-#     qcol = [c for c in results.columns if c.startswith("Q_") and c != "Q_obs"]
-#     qsim_name = qcol[-1] if qcol else None
-#     qsim = results[qsim_name].values if qsim_name else None
-
-#     metrics = {
-#         "gauge_id": basin_id,
-#         "scenario": scenario,
-#         "KGE": calculate_kge(qobs, qsim) if qsim is not None else np.nan,
-#         "NSE": calculate_nse(qobs, qsim) if qsim is not None else np.nan,
-#     }
-
-#     return metrics
-
-
-# # ---------------------------------------------------------
-# # Run from config
-# # ---------------------------------------------------------
-# def run_simulations_from_config(cfg: dict):
-
-#     scenario = normalize_scenario_key(cfg["scenario"])
-#     if scenario == "ALL":
-#         scenarios_to_run = ["BASE", "BUDYKO", "BUDYKO_DA"]
-#     else:
-#         scenarios_to_run = [scenario]
-
-#     paths = cfg["paths"]
-#     DATA_DIR = os.path.join(PROJECT_ROOT, paths["data_dir"])
-
-#     BASE_RESULT_DIR = os.path.join(PROJECT_ROOT, paths["result_dir"])
-#     os.makedirs(BASE_RESULT_DIR, exist_ok=True)
-
-#     # calibrated params
-#     cal_path = os.path.join(PROJECT_ROOT, paths["calibrated_params"])
-#     with open(cal_path, "r") as f:
-#         calibrated_params = json.load(f)
-
-#     da_cfg = cfg.get("da", {})
-#     if "enabled" in da_cfg:
-#         da_cfg.pop("enabled")
-
-#     basin_subset = cfg.get("basins", {}).get("subset", None)
-
-#     # -----------------------------------------------------
-#     # LOAD ALL INPUTS ONCE + COMPUTE BUDYKO ONCE
-#     # -----------------------------------------------------
-#     inputs = load_all_inputs(DATA_DIR)
-
-#     # Determine basins
-#     if basin_subset is None:
-#         basins = list(inputs["Evap_df"].columns)
-#     else:
-#         basins = list(basin_subset)
-
-#     # Filter basins to those present in common_cols AND calibrated_params
-#     common_cols = inputs["common_cols"]
-#     basins = [b for b in basins if (b in common_cols and b in calibrated_params)]
-
-#     budyko_out = compute_budyko_once(inputs, calibrated_params)
-
-#     # Prepare global payload (shipped once per worker)
-#     global_payload = {
-#         "PET_df": inputs["PET_df"],
-#         "Rainf_df": inputs["Rainf_df"],
-#         "Evap_df": inputs["Evap_df"],
-#         "Q_usgs_df": inputs["Q_usgs_df"],
-#         "Q_nldas_df": inputs["Q_nldas_df"],
-#         "Qsb_df": inputs["Qsb_df"],
-#         "M_df": inputs["M_df"],
-#         "RootMoist_df": inputs["RootMoist_df"],
-#         "Slp_df": inputs["Slp_df"],
-#         "common_cols": common_cols,
-#         "ET_B_df": budyko_out["ET_B_df"],
-#         "omega_true_df": budyko_out["omega_true_df"],
-#         "omega_MLR_df": budyko_out["omega_MLR_df"],
-#         "calibrated_params": calibrated_params,
-#     }
-
-#     # Set globals for serial mode (this process)
-#     _init_worker(global_payload)
-
-#     # parallel settings
-#     par_cfg = cfg.get("parallel", {})
-#     par_enabled = bool(par_cfg.get("enabled", True))
-#     max_workers = int(par_cfg.get("max_workers", -1))
-#     if max_workers == -1:
-#         max_workers = max(1, cpu_count() - 1)
-
-#     # -----------------------------------------------------
-#     # RUN EACH SCENARIO
-#     # -----------------------------------------------------
-#     for scenario in scenarios_to_run:
-
-#         scenario_dir = scenario_folder_name(scenario)
-#         RESULT_DIR = os.path.join(BASE_RESULT_DIR, scenario_dir)
-#         os.makedirs(RESULT_DIR, exist_ok=True)
-
-#         all_metrics = []
-
-#         if par_enabled:
-#             with ProcessPoolExecutor(
-#                 max_workers=max_workers,
-#                 initializer=_init_worker,
-#                 initargs=(global_payload,),
-#             ) as executor:
-#                 futures = {
-#                     executor.submit(
-#                         simulate_basin, b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg
-#                     ): b
-#                     for b in basins
-#                 }
-
-#                 for f in tqdm(as_completed(futures), total=len(futures), desc=f"Running scenario={scenario}"):
-#                     out = f.result()
-#                     if out is not None:
-#                         all_metrics.append(out)
-#         else:
-#             for b in tqdm(basins, desc=f"Running scenario={scenario}"):
-#                 out = simulate_basin(b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg)
-#                 if out is not None:
-#                     all_metrics.append(out)
-
-#         pd.DataFrame(all_metrics).to_csv(
-#             os.path.join(RESULT_DIR, f"metrics_{scenario}.csv"),
-#             index=False
-#         )
-
-#         print(f"\n✅ Completed successfully: scenario={scenario}. Results saved to {RESULT_DIR}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # scripts/run_simulation.py
-# import os
-# import sys
-# import json
-# import logging
-# from concurrent.futures import ProcessPoolExecutor, as_completed
-# from multiprocessing import cpu_count
-
-# import numpy as np
-# import pandas as pd
-# from tqdm import tqdm
-
-# PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# if PROJECT_ROOT not in sys.path:
-#     sys.path.insert(0, PROJECT_ROOT)
-
-# # ✅ DO NOT import anything from run.py (avoids circular import)
-
-# from src.model import ModelParams, two_store_model_step
-# from src.budyko import BudykoModelEstimator
-# from src.enkf import EnKFConfig, enkf_update_stochastic_scalar, enkf_forecast_step_states
-# from src.metrics import calculate_kge, calculate_nse
-
-
-# def scenario_folder_name(scenario: str) -> str:
-#     s = str(scenario).strip().upper()
-
-#     if s == "BASE":
-#         return "BASE_MODEL"
-#     elif s == "BUDYKO":
-#         return "BUDYKO_MODEL"
-#     elif s in ["BUDYKO_DA", "BUDYKO+DA", "DA", "ENKF"]:
-#         return "BUDYKO_DA"
-#     else:
-#         return f"{s}_SCENARIO"
-
-
-# # ---------------------------------------------------------
-# # Feather loader
-# # ---------------------------------------------------------
-# def load_feather_df(fname: str, ddir: str) -> pd.DataFrame:
-#     path = os.path.join(ddir, fname)
-#     if not os.path.exists(path):
-#         logging.warning(f"File not found: {path}. Returning empty DataFrame.")
-#         return pd.DataFrame()
-
-#     df = pd.read_feather(path).dropna(axis=1, how="all")
-
-#     if "time" in df.columns:
-#         df["time"] = pd.to_datetime(df["time"])
-#         df.set_index("time", inplace=True)
-
-#     return df
-
-
-# # ---------------------------------------------------------
-# # Deterministic single-run model
-# # ---------------------------------------------------------
-# def run_model_deterministic(
-#     P: np.ndarray,
-#     PET: np.ndarray,
-#     params_cal: ModelParams,
-#     S_init: float,
-#     G_init: float,
-#     Gmax_cal: float,
-#     ET_series: np.ndarray,
-# ):
-#     L = len(P)
-#     S, G = float(S_init), float(G_init)
-
-#     Q_out, S_out, G_out = np.full(L, np.nan), np.full(L, np.nan), np.full(L, np.nan)
-
-#     for t in range(L):
-#         P_t = float(P[t]) if np.isfinite(P[t]) else 0.0
-#         PET_t = float(PET[t]) if np.isfinite(PET[t]) else 0.0
-
-#         S, G, _, Q, *_ = two_store_model_step(
-#             S, G, P_t, PET_t, params_cal,
-#             ET_override=float(ET_series[t]) if np.isfinite(ET_series[t]) else None # given  new ET, update storages (S,G) and compute Q
-#         )
-
-#         G = np.clip(G, 0.0, Gmax_cal)
-
-#         Q_out[t] = max(Q, 0.0)
-#         S_out[t] = S
-#         G_out[t] = G
-
-#     return Q_out, S_out, G_out
-
-
-# # # ---------------------------------------------------------
-# # # DA run (EnKF) -> produces ET_ass and Q_ass_mean
-# # # ---------------------------------------------------------
-# # def run_budyko_da(
-# #     P: np.ndarray,
-# #     PET: np.ndarray,
-# #     ET_B: np.ndarray,
-# #     params_cal: ModelParams,
-# #     S_init: float,
-# #     G_init: float,
-# #     Smax_cal: float,
-# #     Gmax_cal: float,
-# #     config: EnKFConfig,
-# #     basin_id: str,
-# # ):
-# #     L = len(P)
-# #     nens = int(config.nens)
-# #     inflation = float(config.inflation)
-# #     R_ET_var = float(config.R_ET_std) ** 2
-
-# #     rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
-
-# #     # Initial ensemble states [S,G]
-# #     S0_ens = np.clip(S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens), 0.0, Smax_cal)
-# #     G0_ens = np.clip(G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens), 0.0, Gmax_cal)
-# #     X = np.vstack([S0_ens, G0_ens])  
-
-# #     # Save ensemble histories
-# #     S_ens_hist  = np.full((L, nens), np.nan)
-# #     G_ens_hist  = np.full((L, nens), np.nan)
-# #     ET_ens_hist = np.full((L, nens), np.nan)
-# #     Q_ens_hist  = np.full((L, nens), np.nan)
-
-# #     # mean time series
-# #     ET_ass_mean = np.full(L, np.nan)
-# #     Q_ass_mean  = np.full(L, np.nan)
-
-# #     for t in range(L):
-
-# #         # Forecast
-# #         X_f, ET_ens, Q_ens = enkf_forecast_step_states(
-# #             X=X,
-# #             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-# #             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-# #             params_cal=params_cal,
-# #             Smax=Smax_cal,
-# #             Gmax=Gmax_cal,
-# #             rng=rng,
-
-# #             proc_S_std=float(config.proc_S_std),
-# #             proc_G_std=float(config.proc_G_std),
-# #             P_std_frac=float(config.P_std_frac),
-# #             PET_std_frac=float(config.PET_std_frac),
-            
-
-# #             ET_override=None, # This lets the state (S/G) evolve or update
-# #         )
-
-# #         ET_ens_hist[t, :] = ET_ens
-# #         Q_ens_hist[t, :] = Q_ens
-
-# #         ET_ass_mean[t] = np.nanmean(ET_ens)
-# #         Q_ass_mean[t] = np.nanmean(Q_ens)
-
-# #         # Analysis (assimilate ET_B)
-# #         if np.isfinite(ET_B[t]):
-# #             X = enkf_update_stochastic_scalar(
-# #                 X=X_f,
-# #                 y_obs=float(ET_B[t]),
-# #                 HX=ET_ens.copy(),
-# #                 R_var=R_ET_var,
-# #                 inflation=inflation,
-# #                 Smax=Smax_cal,
-# #                 Gmax=Gmax_cal,
-# #                 rng=rng,
-# #             )
-# #         else:
-# #             X = X_f
-
-# #         S_ens_hist[t, :] = X[0, :]
-# #         G_ens_hist[t, :] = X[1, :]
-
-# #     enkf_hist = {
-# #         "time": np.arange(L),
-# #         "nens": nens,
-# #         "S_ens": S_ens_hist,
-# #         "G_ens": G_ens_hist,
-# #         "ET_ens": ET_ens_hist,
-# #         "Q_ens": Q_ens_hist,
-# #     }
-
-# #     return ET_ass_mean, Q_ass_mean, enkf_hist
-
-# # ---------------------------------------------------------
-# # DA run (EnKF) -> assimilates ET_model toward ET_obs
-# # produces ET_ass_mean (posterior) and Q_ass_mean
-# # ---------------------------------------------------------
-# def run_budyko_da(
-#     P: np.ndarray,
-#     PET: np.ndarray,
-#     ET_obs: np.ndarray,     # ✅ truth (e.g., ET_B)
-#     ET_model: np.ndarray,   # ✅ model (e.g., ET_ke)
-#     params_cal: ModelParams,
-#     S_init: float,
-#     G_init: float,
-#     Smax_cal: float,
-#     Gmax_cal: float,
-#     config: EnKFConfig,
-#     basin_id: str,
-# ):
-#     L = len(P)
-#     nens = int(config.nens)
-#     inflation = float(config.inflation)
-#     R_ET_var = float(config.R_ET_std) ** 2
-
-#     rng = np.random.default_rng(hash(basin_id) % (2**32 - 1))
-
-#     # Initial ensemble states [S,G]
-#     S0_ens = np.clip(
-#         S_init + rng.normal(0.0, 0.05 * Smax_cal, size=nens),
-#         0.0, Smax_cal
-#     )
-#     G0_ens = np.clip(
-#         G_init + rng.normal(0.0, 0.05 * Gmax_cal, size=nens),
-#         0.0, Gmax_cal
-#     )
-#     X = np.vstack([S0_ens, G0_ens])  # shape = (2, nens)
-
-#     # Save ensemble histories
-#     S_ens_hist  = np.full((L, nens), np.nan)
-#     G_ens_hist  = np.full((L, nens), np.nan)
-#     ET_ens_hist = np.full((L, nens), np.nan)
-#     Q_ens_hist  = np.full((L, nens), np.nan)
-
-#     # mean time series (posterior)
-#     ET_ass_mean = np.full(L, np.nan)
-#     Q_ass_mean  = np.full(L, np.nan)
-
-#     for t in range(L):
-
-#         # -------------------------------------------------
-#         # Forecast: ET is forced to ET_model[t] (ET_ke)
-#         # -------------------------------------------------
-#         ET_override_t = float(ET_model[t]) if np.isfinite(ET_model[t]) else None
-
-#         X_f, ET_ens_f, Q_ens_f = enkf_forecast_step_states(
-#             X=X,
-#             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-#             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-#             params_cal=params_cal,
-#             Smax=Smax_cal,
-#             Gmax=Gmax_cal,
-#             rng=rng,
-
-#             proc_S_std=float(config.proc_S_std),
-#             proc_G_std=float(config.proc_G_std),
-#             P_std_frac=float(config.P_std_frac),
-#             PET_std_frac=float(config.PET_std_frac),
-#             ET_override=ET_override_t,
-#         )
-
-#         # Save prior (forecast) ET/Q
-#         ET_ens_hist[t, :] = ET_ens_f
-#         Q_ens_hist[t, :]  = Q_ens_f
-
-#         # -------------------------------------------------
-#         # Analysis: assimilate ET_obs[t] (ET_B) into state
-#         # -------------------------------------------------
-#         if np.isfinite(ET_obs[t]):
-#             X_a = enkf_update_stochastic_scalar(
-#                 X=X_f,
-#                 y_obs=float(ET_obs[t]),   # ✅ truth
-#                 HX=ET_ens_f.copy(),       # ✅ model forecast ET
-#                 R_var=R_ET_var,
-#                 inflation=inflation,
-#                 Smax=Smax_cal,
-#                 Gmax=Gmax_cal,
-#                 rng=rng,
-#             )
-#         else:
-#             X_a = X_f
-
-#         # -------------------------------------------------
-#         # Posterior: recompute ET/Q from updated states
-#         # (so ET_ass reflects assimilation)
-#         # -------------------------------------------------
-#         X_dummy, ET_ens_a, Q_ens_a = enkf_forecast_step_states(
-#             X=X_a,
-#             P_t=float(P[t]) if np.isfinite(P[t]) else 0.0,
-#             PET_t=float(PET[t]) if np.isfinite(PET[t]) else 0.0,
-#             params_cal=params_cal,
-#             Smax=Smax_cal,
-#             Gmax=Gmax_cal,
-#             rng=rng,
-
-#             proc_S_std=0.0,   # no additional noise in posterior evaluation
-#             proc_G_std=0.0,
-#             P_std_frac=0.0,
-#             PET_std_frac=0.0,
-
-#             # ✅ keep same ET model forcing
-#             ET_override=ET_override_t,
-#         )
-
-#         # Save posterior means (this is the assimilated ET)
-#         ET_ass_mean[t] = np.nanmean(ET_ens_a)
-#         Q_ass_mean[t]  = np.nanmean(Q_ens_a)
-
-#         # Store updated ensemble states and continue
-#         X = X_a
-#         S_ens_hist[t, :] = X[0, :]
-#         G_ens_hist[t, :] = X[1, :]
-
-#     enkf_hist = {
-#         "time": np.arange(L),
-#         "nens": nens,
-#         "S_ens": S_ens_hist,
-#         "G_ens": G_ens_hist,
-#         "ET_ens": ET_ens_hist,   # prior ET ensemble (ET_model-driven)
-#         "Q_ens": Q_ens_hist,     # prior Q ensemble
-#     }
-
-#     return ET_ass_mean, Q_ass_mean, enkf_hist
-
-
-# # ---------------------------------------------------------
-# # Scenario normalization
-# # ---------------------------------------------------------
-# def normalize_scenario_key(s: str) -> str:
-#     s = str(s).strip().upper()
-
-#     mapping = {
-#         "ALL": "ALL",
-
-#         "BASE": "BASE",
-#         "BASE_MODEL": "BASE",
-#         "BASE-MODEL": "BASE",
-
-#         "BUDYKO": "BUDYKO",
-#         "BUDYKO_MODEL": "BUDYKO",
-#         "BUDYKO-MODEL": "BUDYKO",
-
-#         "BUDYKO_DA": "BUDYKO_DA",
-#         "BUDYKO_DA_MODEL": "BUDYKO_DA",
-#         "BUDYKO+DA": "BUDYKO_DA",
-#         "DA": "BUDYKO_DA",
-#         "ENKF": "BUDYKO_DA",
-#         "ASSIMILATION": "BUDYKO_DA",
-#     }
-
-#     if s not in mapping:
-#         raise ValueError(f"Unknown scenario: {s}")
-
-#     return mapping[s]
-
-
-# # ---------------------------------------------------------
-# # Main simulation per basin
-# # ---------------------------------------------------------
-# def simulate_basin(basin_id, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg: dict):
-
-#     PET_df = load_feather_df("PotEvap.feather", DATA_DIR)
-#     Rainf_df = load_feather_df("Rainf.feather", DATA_DIR)
-#     Evap_df = load_feather_df("EVap.feather", DATA_DIR)
-#     Q_usgs_df = load_feather_df("Q_USGS.feather", DATA_DIR)
-#     Q_nldas_df = load_feather_df("Q_nldas_mm_monthly.feather", DATA_DIR)
-#     Qsb_df = load_feather_df("Qsb.feather", DATA_DIR)
-#     M_df = load_feather_df("M.feather", DATA_DIR)
-#     RootMoist = load_feather_df("SoilM_0_200cm.feather", DATA_DIR)
-#     Slp_df = load_feather_df("slope.feather", DATA_DIR)
-
-
-#     common_cols = sorted(
-#         set(Evap_df.columns)
-#         & set(Qsb_df.columns)
-#         & set(PET_df.columns)
-#         & set(M_df.columns)
-#         & set(RootMoist.columns)
-#         & set(Slp_df.columns)
-#     )
-
-#     if basin_id not in common_cols or basin_id not in calibrated_params:
-#         return None
-
-#     Evap_df, Qsb_df, PET_df, M_df, RootMoist = (
-#         Evap_df[common_cols], Qsb_df[common_cols], PET_df[common_cols],
-#         M_df[common_cols], RootMoist[common_cols]
-#     )
-
-#     idx = Evap_df.index
-#     L = len(idx)
-
-#     p = calibrated_params[basin_id]
-#     PET = PET_df[basin_id].values
-#     P = Rainf_df.get(basin_id, pd.Series(index=idx)).values
-#     Q_obs = Q_usgs_df.get(basin_id, pd.Series(index=idx)).reindex(idx).values
-#     Q_nldas = Q_nldas_df.get(basin_id, pd.Series(index=idx)).values
-#     Qsb = Qsb_df.get(basin_id, pd.Series(index=idx)).values
-#     Slp = Slp_df.get(basin_id, pd.Series(index=idx)).values
-#     # ET_nldas = Evap_df[basin_id].values
-
-#     # Budyko ET
-#     M_basin = M_df.copy()
-#     M_basin.index = pd.to_datetime(M_basin.index)
-#     M_basin = M_basin.loc[idx]
-#     Evap_df = Evap_df[common_cols]
-#     Qsb_df  = Qsb_df[common_cols]
-#     PET_df  = PET_df[common_cols]
-#     M_df    = M_df[common_cols]
-#     Slp_df    = Slp_df[common_cols]
-#     RootMoist = RootMoist[common_cols]
-
-#     budyko = BudykoModelEstimator(
-#         Evap_df=Evap_df[common_cols],
-#         Qsb_monthly=Qsb_df[common_cols],
-#         PotEvap_df=PET_df[common_cols],
-#         M_basin=RootMoist[common_cols],
-#         Slope_basin=RootMoist[common_cols],  
-#         calibrated_params=calibrated_params,
-#     )
-
-#     budyko.estimate_budyko_et()
-#     omega_true_all = budyko.omega_true[basin_id].reindex(idx).to_numpy().ravel()
-#     omega_MLR_all  = budyko.omega_MLR[basin_id].reindex(idx).to_numpy().ravel()
-#     ET_B           = budyko.ET_B[basin_id].reindex(idx).to_numpy().ravel()
-
-#     # Model params
-#     Smax_cal = float(p.get("Smax", 50.0))
-#     Gmax_factor = float(p.get("Gmax_factor", 4.0))
-#     Gmax_cal = Smax_cal * Gmax_factor
-
-#     S_init = float(p.get("S_init", 0.5 * Smax_cal))
-#     G_init = float(p.get("G_init", 0.5 * Gmax_cal))
-
-#     params_cal = ModelParams(
-#         Smax=Smax_cal,
-#         Kperc=p["Kperc"],
-#         Kb=p["Kb"],
-#         Ke=p["Ke"],
-#         Cqq=p["Cqq"],
-#         Sfc_frac=0.30,
-#         beta_et=2.0,
-#     )
-
-#     ET_ke = PET * params_cal.Ke
-
-#     enkf_hist = None # NO DA
-#     ET_ass_mean = np.full(L, np.nan)
-#     Q_ass_mean = np.full(L, np.nan)
-
-#     if scenario == "BASE":
-#         Q_base, S_base, G_base = run_model_deterministic(
-#             P=P, 
-#             PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_ke,  # Simple Scaling Based ET
-#         )
-
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "P": P,
-#             "PET": PET,
-#             "ET_ke": ET_ke,
-#             "Q_bs" :Qsb,
-#             "Q_obs": Q_obs,
-#             "Q_base": Q_budyko,
-#             "S_base": S_base,
-#             "G_base": G_base
-#         }).set_index("time")
-
-
-#     elif scenario == "BUDYKO":
-#         Q_budyko, S_budyko, G_budyko = run_model_deterministic(
-#             P=P, PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_B,  # Budyko ET
-#         )
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "omega_true": omega_true_all,
-#             "omega_MLR": omega_MLR_all,
-#             "P": P,
-#             "PET": PET,
-#             "ET_B": ET_B,
-#             "Q_obs": Q_obs,
-#             "Q_budyko": Q_base,
-#             "S_budyko": S_budyko,
-#             "G_budyko": G_budyko,
-#         }).set_index("time")
-
-# # ET assimilation with Budyko, but Q is determined deterministically
-
-#     elif scenario == "BUDYKO_DA":
-#         config = EnKFConfig(**da_cfg)
-
-#         ET_ass_mean, Q_ass_mean, enkf_hist = run_budyko_da(
-#             P=P,
-#             PET=PET,
-#             ET_obs=ET_B,      # true
-#             ET_model=ET_ke,   # model, assummed as model value to be corrected in the DA
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Smax_cal=Smax_cal,
-#             Gmax_cal=Gmax_cal,
-#             config=config,
-#             basin_id=basin_id,
-#         )
-
-
-#         Q_ass, S_ass, G_ass = run_model_deterministic(
-#             P=P, PET=PET,
-#             params_cal=params_cal,
-#             S_init=S_init,
-#             G_init=G_init,
-#             Gmax_cal=Gmax_cal,
-#             ET_series=ET_ass_mean,
-#         )
-
-#         results = pd.DataFrame({
-#             "time": idx,
-#             "P": P,
-#             "PET": PET,
-#             "ET_B": ET_B,
-#             "ET_ass": ET_ass_mean,
-#             "Q_obs": Q_obs,
-#             "Q_ass": Q_ass,
-#             "Q_ens": Q_ass_mean,
-            
-#         }).set_index("time")
-
-#     else:
-#         raise ValueError(f"Unknown scenario: {scenario}")
-
-#     # Save results
-#     result_path = os.path.join(RESULT_DIR, f"results_{scenario}_{basin_id}.feather")
-#     results.reset_index().to_feather(result_path)
-#     if scenario == "BUDYKO_DA" and enkf_hist is not None:
-
-#         # save ensemble mean as a feather file
-#         enkf_df = pd.DataFrame({
-#             "time": idx,
-#             "ET_ens_mean": np.nanmean(enkf_hist["ET_ens"], axis=1),
-#             "Q_ens_mean": np.nanmean(enkf_hist["Q_ens"], axis=1),
-#             "S_ens_mean": np.nanmean(enkf_hist["S_ens"], axis=1),
-#             "G_ens_mean": np.nanmean(enkf_hist["G_ens"], axis=1),
-#         })
-
-#         enkf_path = os.path.join(RESULT_DIR, f"enkf_ensemble_{scenario}_{basin_id}.feather")
-#         enkf_df.to_feather(enkf_path)
-
-
-#     # Metrics
-#     qobs = results["Q_obs"].values if "Q_obs" in results.columns else Q_obs
-
-#     qcol = [c for c in results.columns if c.startswith("Q_") and c != "Q_obs"]
-#     qsim_name = qcol[-1] if qcol else None
-#     qsim = results[qsim_name].values if qsim_name else None
-
-#     metrics = {
-#         "gauge_id": basin_id,
-#         "scenario": scenario,
-#         "KGE": calculate_kge(qobs, qsim) if qsim is not None else np.nan,
-#         "NSE": calculate_nse(qobs, qsim) if qsim is not None else np.nan,
-#     }
-
-#     return metrics
-
-
-# # ---------------------------------------------------------
-# # Run from config
-# # ---------------------------------------------------------
-# def run_simulations_from_config(cfg: dict):
-
-#     scenario = normalize_scenario_key(cfg["scenario"])
-#     if scenario == "ALL":
-#         scenarios_to_run = ["BASE", "BUDYKO", "BUDYKO_DA"]
-#     else:
-#         scenarios_to_run = [scenario]
-
-#     paths = cfg["paths"]
-#     DATA_DIR = os.path.join(PROJECT_ROOT, paths["data_dir"])
-
-#     BASE_RESULT_DIR = os.path.join(PROJECT_ROOT, paths["result_dir"])
-#     os.makedirs(BASE_RESULT_DIR, exist_ok=True)
-
-#     # calibrated params
-#     cal_path = os.path.join(PROJECT_ROOT, paths["calibrated_params"])
-#     with open(cal_path, "r") as f:
-#         calibrated_params = json.load(f)
-
-#     da_cfg = cfg.get("da", {})
-#     if "enabled" in da_cfg:
-#         da_cfg.pop("enabled")
-
-#     basin_subset = cfg.get("basins", {}).get("subset", None)
-
-#     # Determine basins
-#     if basin_subset is None:
-#         tmp = load_feather_df("EVap.feather", DATA_DIR)
-#         basins = list(tmp.columns)
-#     else:
-#         basins = list(basin_subset)
-
-#     # parallel settings
-#     par_cfg = cfg.get("parallel", {})
-#     par_enabled = bool(par_cfg.get("enabled", True))
-#     max_workers = int(par_cfg.get("max_workers", -1))
-#     if max_workers == -1:
-#         max_workers = max(1, cpu_count() - 1)
-
-#     # -----------------------------------------------------
-#     # RUN EACH SCENARIO
-#     # -----------------------------------------------------
-#     for scenario in scenarios_to_run:
-
-#         scenario_dir = scenario_folder_name(scenario)
-#         RESULT_DIR = os.path.join(BASE_RESULT_DIR, scenario_dir)
-#         os.makedirs(RESULT_DIR, exist_ok=True)
-
-#         all_metrics = []
-
-#         if par_enabled:
-#             with ProcessPoolExecutor(max_workers=max_workers) as executor:
-#                 futures = {
-#                     executor.submit(
-#                         simulate_basin, b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg
-#                     ): b
-#                     for b in basins
-#                 }
-
-#                 for f in tqdm(as_completed(futures), total=len(futures), desc=f"Running scenario={scenario}"):
-#                     out = f.result()
-#                     if out is not None:
-#                         all_metrics.append(out)
-#         else:
-#             for b in tqdm(basins, desc=f"Running scenario={scenario}"):
-#                 out = simulate_basin(b, scenario, DATA_DIR, RESULT_DIR, calibrated_params, da_cfg)
-#                 if out is not None:
-#                     all_metrics.append(out)
-
-#         pd.DataFrame(all_metrics).to_csv(
-#             os.path.join(RESULT_DIR, f"metrics_{scenario}.csv"),
-#             index=False
-#         )
-
-#         print(f"\n✅ Completed successfully: scenario={scenario}. Results saved to {RESULT_DIR}")
+        print(f"\n✅  scenario={sc} complete — results in {RESULT_DIR}")
 
 

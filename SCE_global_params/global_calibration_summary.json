@@ -1,0 +1,13 @@
+{
+  "mean_train_kge": 0.1648770388755315,
+  "median_train_kge": 0.45257529698679627,
+  "mean_test_kge": -0.03256029603141873,
+  "median_test_kge": 0.4000974602975679,
+  "n_train": 468,
+  "n_test": 201,
+  "reps_fast": 1000,
+  "reps_slow": 1000,
+  "min_valid_months": 12,
+  "min_valid_basin_fraction": 0.8,
+  "invalid_basin_penalty": 1.0
+}

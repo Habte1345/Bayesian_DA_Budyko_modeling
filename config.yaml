@@ -4,19 +4,23 @@ scenario: all   # all | base | budyko | budyko_da
 paths:
   data_dir: data/processed
   result_dir: Simulation_results
-  calibrated_params: SCE_cal_params/final_calibrated_params.json
-
+  calibrated_params: SCE_cal_params/calibrated_params.json
+  global_calibrated_params: SCE_global_params/global_calibrated_params.json
 # Data assimilation config
 da:
   enabled: true
-  nens: 10
-  inflation: 0.5
-  R_ET_std: 20.0
-  proc_S_std: 0.13
-  proc_G_std: 0.7
-  P_std_frac: 0.10
-  PET_std_frac: 0.03
+  nens: 300
+  inflation: 1.20
+  R_ET_std: 0.4      # ~25% of mean ET (1.74 mm/month)
+  R_Q_std: 0.5       # ~28% of mean Q  (1.77 mm/month)
+  R_ET_frac: 0.20    # relative floor: 20% of observation — scales with large events
+  R_Q_frac: 0.20     # relative floor: 20% of observation
+  proc_S_std: 3.0    # fine — absolute mm, 2% of typical Smax
+  proc_G_std: 5.0    # fine — absolute mm
+  P_std_frac: 0.25
+  PET_std_frac: 0.10
 
+  
 parallel:
   enabled: true
   max_workers: -1
@@ -25,7 +29,7 @@ basins:
   subset: null
 
 # Default run mode if CLI not provided
-param_mode: Simulation_with_UNCALIB_PARAMS   # Simulation_with_CALIB_PARAMS | Simulation_with_UNCALIB_PARAMS
+param_mode: Simulation_with_BASIN_CALIB_PARAMS   # Simulation_with_BASIN_CALIB_PARAMS | Simulation_with_GLOBAL_CAL_PARAMS
 
 # Parameter configs (canonical keys!)
 # params:

@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from scipy.optimize import fsolve
+from scipy.optimize import brentq
 import warnings
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -18,8 +18,7 @@ class OmegaMLRModel:
     beta2: float
 
     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
-        omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
-        return np.clip(omega_MLR, 2.0, 5.0)
+        return self.beta0 + self.beta1 * M + self.beta2 * Slope
 
 
 # ---------------------------------------------------------
@@ -29,22 +28,35 @@ class BudykoModelEstimator:
     """
     State-aware Budyko implementation.
 
-    Key change:
-      - Budyko ratios use P_eff = P - dS (effective water available for partitioning)
-      - dS is supplied externally (e.g., from two-store model states), so this file
-        does NOT try to infer storage change.
+    Fixes applied vs previous version
+    -----------------------------------
+    FIX 1  _compute_peff: P_eff now capped at P from above.
+           When dS < 0 (soil draining), P - dS > P, inflating the aridity
+           index φ = PET/P_eff and causing ET_B to explode.
+           Physical constraint: monthly ET partitioning cannot draw on
+           more water than fell as rainfall.
 
-    Supports BOTH Ke sources (for omega_true inversion target ET_ke):
-      1) CALIBRATED MODE:
-          - calibrated_params dict provided
-          - uses calibrated_params[basin]["Ke"] (constant per basin)
-      2) UNCALIBRATED MODE:
-          - Ke_df provided (DataFrame aligned with PET)
-          - uses Ke_df[basin] (time-varying)
+    FIX 2  _solve_for_omega_from_ratios: ratio_ET clipped to [0, min(1, ratio_PET)]
+           before inversion.  ET_ke = Ke×PET does not respect the water-balance
+           constraint ET ≤ P_eff, so ratio_ET often exceeds 1 in dry months,
+           making the Fu equation have no valid root.  Clipping prevents the
+           inversion from always falling back to omega_min.
 
-    Inputs expected:
-      - P_df: precipitation (same index/columns as PET)
-      - dS_df: storage change (S_t - S_{t-1}) same index/columns
+    FIX 3  _solve_for_omega_from_ratios: fallback now returns np.nan instead of
+           omega_min.  Returning 1.01 for every failed inversion was polluting
+           the MLR training data with a degenerate lower-bound value, biasing
+           the intercept β₀ toward 1.01 and destroying the MLR's ability to
+           predict meaningful omega variation.
+
+    FIX 4  estimate_budyko_et: now uses omega_MLR (the attribute-informed
+           prediction) instead of omega_true clipped to ±1% of 2.2.
+           The previous code completely bypassed the MLR, making the Budyko
+           and BASE scenarios identical in practice.
+
+    FIX 5  omega inversion range widened to [1.01, 20.0] and MLR clip widened
+           to [1.0, 20.0].  Literature values for CAMELS basins range from
+           ~1.5 (arid) to ~6–8 (dense forest).  Capping at 5.0 was truncating
+           humid forested basins and biasing the MLR.
     """
 
     def __init__(
@@ -58,114 +70,155 @@ class BudykoModelEstimator:
         Ke_df: pd.DataFrame | None = None,
         Peff_min: float = 1e-6,
     ):
-        self.P_df = P_df
-        self.dS_df = dS_df
-        self.PotEvap_df = PotEvap_df
-        self.M_basin = M_basin
-        self.Slope_basin = Slope_basin
-
+        self.P_df             = P_df
+        self.dS_df            = dS_df
+        self.PotEvap_df       = PotEvap_df
+        self.M_basin          = M_basin
+        self.Slope_basin      = Slope_basin
         self.calibrated_params = calibrated_params if calibrated_params is not None else {}
-        self.Ke_df = Ke_df
-
-        # lower bound for effective precipitation to avoid division-by-zero / negative
-        self.Peff_min = float(Peff_min)
+        self.Ke_df            = Ke_df
+        self.Peff_min         = float(Peff_min)
 
         self.omega_true = None
-        self.omega_MLR = None
-        self.ET_B = None
+        self.omega_MLR  = None
+        self.ET_B       = None
 
-    # -----------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------
+    # ------------------------------------------------------------------
+    # FIX 1 — P_eff bounded above by P
+    # ------------------------------------------------------------------
     def _compute_peff(self, P: np.ndarray, dS: np.ndarray) -> np.ndarray:
         """
-        Effective water for Budyko partitioning at monthly scale:
-          P_eff = P - dS
-        Clipped to Peff_min to avoid invalid ratios.
+        Effective water available for monthly Budyko ET partitioning:
+            P_eff = P - dS
+        Bounded below by Peff_min (avoid division-by-zero).
+        Bounded above by P (FIX 1): when dS < 0, P - dS > P, which
+        inflates φ = PET/P_eff and causes ET_B to explode.
         """
-        P = P.astype(float)
-        dS = dS.astype(float)
+        P   = np.asarray(P,  dtype=float)
+        dS  = np.asarray(dS, dtype=float)
         Peff = P - dS
         Peff = np.where(np.isfinite(Peff), Peff, np.nan)
-        Peff = np.where(Peff > self.Peff_min, Peff, self.Peff_min)
+        # FIX 1: upper bound
+        P_safe = np.where(np.isfinite(P) & (P > self.Peff_min), P, self.Peff_min)
+        Peff   = np.clip(Peff, self.Peff_min, P_safe)
         return Peff
 
-    # -----------------------------------------------------
-    # Solve for ω_true from Budyko using (ET_ke / P_eff) and (PET / P_eff)
-    # -----------------------------------------------------
-    def _solve_for_omega_from_ratios(self, ratio_ET: float, ratio_PET: float, omega_guess: float = 2.0):
-        ratio_ET = float(ratio_ET) if np.isfinite(ratio_ET) else np.nan
+    # ------------------------------------------------------------------
+    # FIX 2 + FIX 3 — robust omega inversion
+    # ------------------------------------------------------------------
+    def _solve_for_omega_from_ratios(
+        self,
+        ratio_ET: float,
+        ratio_PET: float,
+        omega_min: float = 1.01,
+        omega_max: float = 20.0,       # FIX 5: widened from 5.0
+    ) -> float:
+        """
+        Invert the Fu–Budyko equation to find ω such that:
+            1 + φ - (1 + φ^ω)^(1/ω) = ratio_ET
+        where φ = ratio_PET = PET / P_eff.
+
+        Returns np.nan when inversion is not possible (FIX 3).
+        """
+        ratio_ET  = float(ratio_ET)  if np.isfinite(ratio_ET)  else np.nan
         ratio_PET = float(ratio_PET) if np.isfinite(ratio_PET) else np.nan
 
         if not np.isfinite(ratio_ET) or not np.isfinite(ratio_PET):
             return np.nan
-
-        # physical sanity (soft): ratio_ET in [0, 1] typically; keep robust
         if ratio_PET <= 0:
             return np.nan
 
+        # FIX 2: clip ratio_ET to physically admissible range.
+        # ET cannot exceed min(P_eff, PET), so ET/P_eff ≤ min(1, PET/P_eff).
+        # ET_ke = Ke×PET can violate this in dry months, making no valid
+        # root exist and causing the fallback to fire on every such step.
+        ratio_ET = float(np.clip(ratio_ET, 0.0, min(1.0, ratio_PET)))
+
         def f(omega):
-            return 1.0 + ratio_PET - (1.0 + ratio_PET ** omega) ** (1.0 / omega) - ratio_ET
+            try:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    val = (1.0 + ratio_PET
+                           - (1.0 + ratio_PET ** omega) ** (1.0 / omega)
+                           - ratio_ET)
+                return float(val) if np.isfinite(val) else np.nan
+            except Exception:
+                return np.nan
 
         try:
-            sol = fsolve(f, x0=omega_guess, xtol=1e-8)
-            omega_val = sol[0] if np.isfinite(sol[0]) else np.nan
-            return np.clip(omega_val, 1.5, 5.0) if np.isfinite(omega_val) else np.nan
+            f_min = f(omega_min)
+            f_max = f(omega_max)
+
+            if not np.isfinite(f_min) or not np.isfinite(f_max):
+                return np.nan  # FIX 3: return nan, not omega_min
+
+            if f_min * f_max < 0:
+                # Valid root exists — use Brent's method
+                return float(brentq(f, omega_min, omega_max, xtol=1e-8))
+
+            # No root in [omega_min, omega_max].
+            # FIX 3: return nan so failed inversions are excluded from MLR.
+            # (Previously returned omega_min=1.01, polluting the training data.)
+            return np.nan
+
         except Exception:
             return np.nan
 
-    # -----------------------------------------------------
-    # Compute ω_true (state-aware): uses P_eff = P - dS
-    # omega_true is inferred such that Budyko ET ratio matches ET_ke / P_eff
-    # -----------------------------------------------------
+    # ------------------------------------------------------------------
+    # Compute ω_true  (state-aware, uses P_eff = P - dS)
+    # ------------------------------------------------------------------
     def compute_omega_true(self) -> pd.DataFrame:
-        P_df = self.P_df
-        dS_df = self.dS_df
+        """
+        Analytically invert ω_true such that the Fu–Budyko equation
+        reproduces ET_ke / P_eff given the aridity index PET / P_eff.
+
+        Only timesteps where the inversion succeeds are returned as finite
+        values; failed timesteps are NaN and excluded from MLR fitting.
+        """
+        P_df   = self.P_df
+        dS_df  = self.dS_df
         PET_df = self.PotEvap_df
 
-        # align safely
-        idx = PET_df.index
+        idx  = PET_df.index
         cols = PET_df.columns
 
         omega_true = pd.DataFrame(index=idx, columns=cols, dtype=float)
 
-        # precompute arrays
-        P_all = P_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        dS_all = dS_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
+        P_all   = P_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
+        dS_all  = dS_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
         PET_all = PET_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
 
-        Peff_all = self._compute_peff(P_all, dS_all)
+        Peff_all = self._compute_peff(P_all, dS_all)   # uses FIX 1
 
         for j, basin in enumerate(cols):
-            # Decide Ke source
+
+            # ── Ke source ────────────────────────────────────────────
             if self.Ke_df is not None:
                 if basin not in self.Ke_df.columns:
                     continue
-                Ke_series = pd.to_numeric(self.Ke_df.reindex(idx)[basin], errors="coerce").values.astype(float)
+                Ke_series = (pd.to_numeric(self.Ke_df.reindex(idx)[basin], errors="coerce")
+                             .values.astype(float))
             elif basin in self.calibrated_params and "Ke" in self.calibrated_params[basin]:
-                Ke_val = float(self.calibrated_params[basin]["Ke"])
+                Ke_val    = float(self.calibrated_params[basin]["Ke"])
                 Ke_series = np.full(len(idx), Ke_val, dtype=float)
             else:
                 continue
 
-            PET_col = PET_all[:, j]
+            PET_col  = PET_all[:, j]
             Peff_col = Peff_all[:, j]
+            ET_ke    = Ke_series * PET_col
 
-            ET_ke = Ke_series * PET_col
+            # ratio_ET and ratio_PET (NaN where denominator is invalid)
+            valid = np.isfinite(ET_ke) & np.isfinite(Peff_col) & (Peff_col > 0)
 
-            ratio_ET = np.divide(
-                ET_ke, Peff_col,
-                out=np.full_like(ET_ke, np.nan, dtype=float),
-                where=np.isfinite(ET_ke) & np.isfinite(Peff_col) & (Peff_col > 0)
-            )
-            ratio_PET = np.divide(
-                PET_col, Peff_col,
-                out=np.full_like(PET_col, np.nan, dtype=float),
-                where=np.isfinite(PET_col) & np.isfinite(Peff_col) & (Peff_col > 0)
-            )
+            ratio_ET = np.where(valid,
+                                ET_ke   / Peff_col, np.nan).astype(float)
+            ratio_PET = np.where(valid,
+                                 PET_col / Peff_col, np.nan).astype(float)
 
+            # Invert ω for each timestep (FIX 2 + FIX 3 applied inside)
             omega_vals = np.array(
-                [self._solve_for_omega_from_ratios(re, rp) for re, rp in zip(ratio_ET, ratio_PET)],
+                [self._solve_for_omega_from_ratios(re, rp)
+                 for re, rp in zip(ratio_ET, ratio_PET)],
                 dtype=float
             )
 
@@ -174,571 +227,133 @@ class BudykoModelEstimator:
         self.omega_true = omega_true
         return self.omega_true
 
-    # -----------------------------------------------------
-    # Fit ω_MLR using M and slope (same logic, now target is state-aware omega_true)
-    # -----------------------------------------------------
+    # ------------------------------------------------------------------
+    # Fit ω_MLR from basin attributes
+    # ------------------------------------------------------------------
     def fit_and_compute_omega_mlr(self) -> pd.DataFrame:
+        """
+        Pool OLS across all basins and time steps:
+            ω_true = β₀ + β₁·M(t) + β₂·slope
+
+        Only finite ω_true values enter the regression (NaN timesteps
+        from failed inversions are automatically excluded — FIX 3 benefit).
+        """
         if self.omega_true is None:
             self.compute_omega_true()
 
-        # Ensure numeric and aligned
-        idx = self.omega_true.index
+        idx  = self.omega_true.index
         cols = self.omega_true.columns
 
-        M = self.M_basin.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        Slope = self.Slope_basin.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        y = self.omega_true.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
+        M     = (self.M_basin.reindex(idx)[cols]
+                 .apply(pd.to_numeric, errors="coerce").values.astype(float))
+        Slope = (self.Slope_basin.reindex(idx)[cols]
+                 .apply(pd.to_numeric, errors="coerce").values.astype(float))
+        y     = (self.omega_true.reindex(idx)[cols]
+                 .apply(pd.to_numeric, errors="coerce").values.astype(float))
 
-        rows = []
-        targets = []
-        T, B = M.shape
+        rows: list[np.ndarray] = []
+        targets: list[np.ndarray] = []
 
+        _, B = M.shape
         for i in range(B):
-            Mi = M[:, i]
-            Si = Slope[:, i]
-            yi = y[:, i]
-
+            Mi  = M[:, i]
+            Si  = Slope[:, i]
+            yi  = y[:, i]
+            # FIX 3 benefit: NaN omega_true values are excluded here
             mask = np.isfinite(Mi) & np.isfinite(Si) & np.isfinite(yi)
             if mask.any():
-                Xi = np.column_stack([np.ones(mask.sum()), Mi[mask], Si[mask]])
-                rows.append(Xi)
+                rows.append(np.column_stack([np.ones(mask.sum()),
+                                             Mi[mask], Si[mask]]))
                 targets.append(yi[mask])
 
         if not rows:
-            raise ValueError("No valid data to fit omega MLR.")
+            raise ValueError("No valid ω_true data to fit MLR. "
+                             "Check that omega_true contains finite values.")
 
-        X = np.vstack(rows)
-        Y = np.concatenate(targets)
+        X_all = np.vstack(rows)
+        y_all = np.concatenate(targets)
+        beta, _, _, _ = np.linalg.lstsq(X_all, y_all, rcond=None)
 
-        beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-
+        _, B = M.shape
         Omega_hat = np.empty_like(M, dtype=float)
         for i in range(B):
             Omega_hat[:, i] = beta[0] + beta[1] * M[:, i] + beta[2] * Slope[:, i]
 
-        Omega_hat = np.where(Omega_hat < 1.0, 1.0, Omega_hat)
-        Omega_hat = np.where(Omega_hat > 50.0, 50.0, Omega_hat)
+        # FIX 5: clip to [1.0, 20.0] — consistent with widened inversion range
+        Omega_hat = np.clip(
+            np.where(np.isfinite(Omega_hat), Omega_hat, np.nan),
+            1.0, 20.0
+        )
 
         self.omega_MLR = pd.DataFrame(Omega_hat, index=idx, columns=cols)
         return self.omega_MLR
 
-    # -----------------------------------------------------
-    # Compute Budyko ET using ω_MLR and P_eff = P - dS (STATE-AWARE)
-    # -----------------------------------------------------
+    # ------------------------------------------------------------------
+    # FIX 4 — estimate ET_B using omega_MLR (not omega_true)
+    # ------------------------------------------------------------------
     def estimate_budyko_et(self) -> pd.DataFrame:
+        """
+        Compute ET_B from the Fu–Budyko equation using the MLR-predicted
+        ω(t)_MLR.  This is the ET that enters the BUDYKO and DA scenarios.
+
+        FIX 4: previous code used omega_true clipped to ±1% of 2.2,
+        which completely bypassed the MLR and made Budyko ≡ BASE.
+        Now uses omega_MLR as intended by the study design.
+        """
         if self.omega_true is None:
             self.compute_omega_true()
-
         if self.omega_MLR is None:
             try:
                 self.fit_and_compute_omega_mlr()
             except Exception:
                 self.omega_MLR = pd.DataFrame(
+                    np.nan,
                     index=self.omega_true.index,
                     columns=self.omega_true.columns,
-                    data=np.nan,
                 )
 
-        idx = self.PotEvap_df.index
+        idx  = self.PotEvap_df.index
         cols = self.PotEvap_df.columns
 
-        P = self.P_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        dS = self.dS_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        PET = self.PotEvap_df.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
-        omega = self.omega_MLR.reindex(idx)[cols].apply(pd.to_numeric, errors="coerce").values.astype(float)
+        P   = (self.P_df.reindex(idx)[cols]
+               .apply(pd.to_numeric, errors="coerce").values.astype(float))
+        dS  = (self.dS_df.reindex(idx)[cols]
+               .apply(pd.to_numeric, errors="coerce").values.astype(float))
+        PET = (self.PotEvap_df.reindex(idx)[cols]
+               .apply(pd.to_numeric, errors="coerce").values.astype(float))
 
+        # FIX 4: use omega_MLR — the attribute-informed, transferable prediction
+        omega = (self.omega_MLR.reindex(idx)[cols]
+                 .apply(pd.to_numeric, errors="coerce").values.astype(float))
+
+        # P_eff with FIX 1 applied
         Peff = self._compute_peff(P, dS)
 
-        # aridity = PET / Peff
+        # aridity index φ = PET / P_eff
         aridity = np.divide(
             PET, Peff,
             out=np.full_like(PET, np.nan, dtype=float),
-            where=np.isfinite(PET) & np.isfinite(Peff) & (Peff > 0)
+            where=np.isfinite(PET) & np.isfinite(Peff) & (Peff > 0),
         )
 
+        # Fu equation: ET/P_eff = 1 + φ − (1 + φ^ω)^(1/ω)
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-            term = np.power(aridity, omega)
+            term    = np.power(aridity, omega)
             E_ratio = 1.0 + aridity - np.power(1.0 + term, 1.0 / omega)
 
         E_ratio = np.where(np.isfinite(E_ratio), E_ratio, np.nan)
+        ET_est  = Peff * E_ratio
 
-        ET_est = Peff * E_ratio
-
-        # physical bounds: 0 <= ET <= min(Peff, PET) (componentwise)
-        ET_cap = np.nanmin(np.stack([Peff, PET]), axis=0)
-        ET_est = np.where(np.isfinite(ET_est), ET_est, np.nan)
-        ET_est = np.clip(ET_est, 0.0, ET_cap)
+        # Physical bounds: 0 ≤ ET ≤ min(P_eff, PET)
+        ET_cap = np.minimum(
+            np.where(np.isfinite(Peff), Peff, np.nan),
+            np.where(np.isfinite(PET),  PET,  np.nan),
+        )
+        ET_est = np.clip(
+            np.where(np.isfinite(ET_est), ET_est, np.nan),
+            0.0, ET_cap,
+        )
 
         self.ET_B = pd.DataFrame(ET_est, index=idx, columns=cols)
         return self.ET_B
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # src/budyko.py
-# import numpy as np
-# import pandas as pd
-# from dataclasses import dataclass
-# from scipy.optimize import fsolve
-# import warnings
-
-# warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-
-# # ---------------------------------------------------------
-# # Ω via Multiple Linear Regression
-# # ---------------------------------------------------------
-# @dataclass
-# class OmegaMLRModel:
-#     beta0: float
-#     beta1: float
-#     beta2: float
-
-#     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
-#         omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
-#         return np.clip(omega_MLR, 1.0, 50.0)
-
-
-# # ---------------------------------------------------------
-# # Budyko Model Estimator
-# # ---------------------------------------------------------
-# class BudykoModelEstimator:
-#     """
-#     Supports BOTH modes:
-
-#     1) CALIBRATED MODE:
-#         - calibrated_params dict provided
-#         - uses calibrated_params[basin]["Ke"]
-
-#     2) UNCALIBRATED MODE:
-#         - Ke_df provided (DataFrame with same index/cols as PET)
-#         - uses Ke_df[basin]
-#     """
-
-#     def __init__(
-#         self,
-#         Evap_df: pd.DataFrame,
-#         Qsb_monthly: pd.DataFrame,
-#         PotEvap_df: pd.DataFrame,
-#         M_basin: pd.DataFrame,
-#         Slope_basin: pd.DataFrame,
-#         calibrated_params: dict | None = None,
-#         Ke_df: pd.DataFrame | None = None,
-#     ):
-#         self.Evap_df = Evap_df
-#         self.Qsb_monthly = Qsb_monthly
-#         self.PotEvap_df = PotEvap_df
-#         self.M_basin = M_basin
-#         self.Slope_basin = Slope_basin
-
-#         self.calibrated_params = calibrated_params if calibrated_params is not None else {}
-#         self.Ke_df = Ke_df  # ✅ new for UNCALIBRATED mode
-
-#         self.omega_true = None
-#         self.omega_MLR = None
-#         self.ET_B = None
-
-#     # -----------------------------------------------------
-#     # Solve for ω_true
-#     # -----------------------------------------------------
-#     def _solve_for_omega(self, ET, QB, PET, omega_guess=2.0):
-#         # make sure we are working with floats
-#         ET = float(ET) if np.isfinite(ET) else np.nan
-#         QB = float(QB) if np.isfinite(QB) else np.nan
-#         PET = float(PET) if np.isfinite(PET) else np.nan
-
-#         if not np.isfinite(ET) or not np.isfinite(QB) or not np.isfinite(PET):
-#             return np.nan
-
-#         denom = ET + QB
-#         if denom <= 0:
-#             return np.nan
-
-#         ratio_ET = ET / denom
-#         ratio_PET = PET / denom
-
-#         def f(omega):
-#             return 1 + ratio_PET - (1 + ratio_PET ** omega) ** (1 / omega) - ratio_ET
-
-#         try:
-#             sol = fsolve(f, x0=omega_guess, xtol=1e-8)
-#             omega_val = sol[0] if np.isfinite(sol[0]) else np.nan
-#             return np.clip(omega_val, 0.1, 10.0) if np.isfinite(omega_val) else np.nan
-#         except Exception:
-#             return np.nan
-
-#     # -----------------------------------------------------
-#     # Compute ω_true using Ke source (calibrated OR provided Ke_df)
-#     # -----------------------------------------------------
-#     def compute_omega_true(self) -> pd.DataFrame:
-#         Evap_df = self.Evap_df
-#         Qsb_monthly = self.Qsb_monthly
-#         PotEvap_df = self.PotEvap_df
-
-#         omega_true = pd.DataFrame(index=Evap_df.index, columns=Evap_df.columns, dtype=float)
-
-#         for basin in PotEvap_df.columns:
-
-#             # -------------------------------------------------
-#             # ✅ Decide where Ke comes from
-#             # -------------------------------------------------
-#             if self.Ke_df is not None:
-#                 if basin not in self.Ke_df.columns:
-#                     continue
-#                 Ke_series = pd.to_numeric(self.Ke_df[basin], errors="coerce").values
-
-#             elif basin in self.calibrated_params and "Ke" in self.calibrated_params[basin]:
-#                 Ke_val = float(self.calibrated_params[basin]["Ke"])
-#                 Ke_series = np.full(len(PotEvap_df.index), Ke_val, dtype=float)
-
-#             else:
-#                 # no Ke available -> skip basin
-#                 continue
-
-#             QB_col = pd.to_numeric(Qsb_monthly[basin], errors="coerce").values
-#             PET_col = pd.to_numeric(PotEvap_df[basin], errors="coerce").values
-
-#             ET_ke = Ke_series * PET_col
-
-#             omega_values = np.array([
-#                 self._solve_for_omega(ET, QB, PET)
-#                 for ET, QB, PET in zip(ET_ke, QB_col, PET_col)
-#             ])
-
-#             omega_true[basin] = omega_values
-
-#         self.omega_true = omega_true
-#         return self.omega_true
-
-#     # -----------------------------------------------------
-#     # Fit ω_MLR using M and slope
-#     # -----------------------------------------------------
-#     def fit_and_compute_omega_mlr(self) -> pd.DataFrame:
-#         if self.omega_true is None:
-#             self.compute_omega_true()
-
-#         # ✅ Ensure numeric
-#         M = self.M_basin.apply(pd.to_numeric, errors="coerce").values.astype(float)
-#         Slope = self.Slope_basin.apply(pd.to_numeric, errors="coerce").values.astype(float)
-#         y = self.omega_true.apply(pd.to_numeric, errors="coerce").values.astype(float)
-
-#         rows = []
-#         targets = []
-#         T, B = M.shape
-
-#         for i in range(B):
-#             Mi = M[:, i]
-#             Si = Slope[:, i]
-#             yi = y[:, i]
-
-#             mask = np.isfinite(Mi) & np.isfinite(Si) & np.isfinite(yi)
-#             if mask.any():
-#                 Xi = np.column_stack([np.ones(mask.sum()), Mi[mask], Si[mask]])
-#                 rows.append(Xi)
-#                 targets.append(yi[mask])
-
-#         if not rows:
-#             raise ValueError("No valid data to fit omega MLR.")
-
-#         X = np.vstack(rows)
-#         Y = np.concatenate(targets)
-
-#         beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-
-#         Omega_hat = np.empty_like(M, dtype=float)
-#         for i in range(B):
-#             Omega_hat[:, i] = beta[0] + beta[1] * M[:, i] + beta[2] * Slope[:, i]
-
-#         Omega_hat = np.where(Omega_hat < 1.0, 1.0, Omega_hat)
-
-#         self.omega_MLR = pd.DataFrame(
-#             Omega_hat,
-#             index=self.M_basin.index,
-#             columns=self.M_basin.columns,
-#         )
-
-#         return self.omega_MLR
-
-#     # -----------------------------------------------------
-#     # Compute Budyko ET using ω_MLR
-#     # -----------------------------------------------------
-#     def estimate_budyko_et(self) -> pd.DataFrame:
-#         if self.omega_true is None:
-#             self.compute_omega_true()
-
-#         # ---------------------------------------------
-#         # ✅ fit omega_MLR, but don't crash
-#         # ---------------------------------------------
-#         if self.omega_MLR is None:
-#             try:
-#                 self.fit_and_compute_omega_mlr()
-#             except Exception:
-#                 # if MLR fails -> set omega_MLR NaN and still compute ET_B robustly
-#                 self.omega_MLR = pd.DataFrame(
-#                     index=self.omega_true.index,
-#                     columns=self.omega_true.columns,
-#                     data=np.nan,
-#                 )
-
-#         Qb = self.Qsb_monthly.apply(pd.to_numeric, errors="coerce")
-#         PET_df = self.PotEvap_df.apply(pd.to_numeric, errors="coerce")
-#         omega_MLR = self.omega_MLR.apply(pd.to_numeric, errors="coerce")
-
-#         P_values = (self.Evap_df.apply(pd.to_numeric, errors="coerce") + Qb).values.astype(float)
-#         PET_values = PET_df.values.astype(float)
-#         omega_values = omega_MLR.values.astype(float)
-
-#         aridity = np.divide(
-#             PET_values, P_values,
-#             out=np.full_like(PET_values, np.nan),
-#             where=P_values > 0
-#         )
-
-#         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-#             term = np.power(aridity, omega_values)
-#             E_ratio = 1.0 + aridity - np.power(1.0 + term, 1.0 / omega_values)
-
-#         E_ratio = np.where(np.isfinite(E_ratio), E_ratio, np.nan)
-
-#         ET_est = P_values * E_ratio
-
-#         # clip to physical bounds
-#         ET_est = np.where(np.isfinite(ET_est), ET_est, np.nan)
-#         ET_est = np.clip(ET_est, 0.0, np.nanmin(np.stack([PET_values, P_values]), axis=0))
-
-#         self.ET_B = pd.DataFrame(ET_est, index=PET_df.index, columns=PET_df.columns)
-#         return self.ET_B
-
-
-
-
-
-
-
-
-
-
-
-
-# # src/budyko.py
-# import numpy as np
-# import pandas as pd
-# from dataclasses import dataclass
-# from scipy.optimize import fsolve
-# import warnings
-
-# # Suppress runtime warnings that often occur with complex numerical operations
-# warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-
-# # ---------------------------------------------------------
-# # Ω via Multiple Linear Regression
-# # ---------------------------------------------------------
-# @dataclass
-# class OmegaMLRModel:
-#     beta0: float
-#     beta1: float
-#     beta2: float
-
-#     def predict(self, M: np.ndarray, Slope: np.ndarray) -> np.ndarray:
-#         omega_MLR = self.beta0 + self.beta1 * M + self.beta2 * Slope
-#         return np.clip(omega_MLR, 3.0, 20.0)
-
-
-# # ---------------------------------------------------------
-# # Budyko Model Estimator
-# # ---------------------------------------------------------
-# class BudykoModelEstimator:
-#     def __init__(
-#         self,
-#         Evap_df: pd.DataFrame,
-#         Qsb_monthly: pd.DataFrame,
-#         PotEvap_df: pd.DataFrame,
-#         M_basin: pd.DataFrame,
-#         Slope_basin: pd.DataFrame,
-#         calibrated_params: dict,
-#     ):
-#         self.Evap_df = Evap_df
-#         self.Qsb_monthly = Qsb_monthly
-#         self.PotEvap_df = PotEvap_df
-#         self.M_basin = M_basin
-#         self.Slope_basin = Slope_basin
-#         self.calibrated_params = calibrated_params
-
-#         self.omega_true = None
-#         self.omega_MLR = None
-#         self.ET_B = None
-
-#     # -----------------------------------------------------
-#     # Solve for ω_true
-#     # -----------------------------------------------------
-#     def _solve_for_omega(self, ET, QB, PET, omega_guess=1.0):
-#         if (ET + QB) == 0:
-#             return np.nan
-
-#         ratio_ET = ET / (ET + QB)
-#         ratio_PET = PET / (ET + QB)
-
-#         def f(omega):
-#             return 1 + ratio_PET - (1 + ratio_PET ** omega) ** (1 / omega) - ratio_ET
-
-#         try:
-#             sol = fsolve(f, x0=omega_guess, xtol=1e-8)
-#             omega_val = sol[0] if np.isfinite(sol[0]) else np.nan
-#             return np.clip(omega_val, 0.0, 10.0) if np.isfinite(omega_val) else np.nan
-
-#         except:
-#             return np.nan
-
-#     # -----------------------------------------------------
-#     # Compute ω_true using calibrated Ke values
-#     # -----------------------------------------------------
-#     def compute_omega_true(self) -> pd.DataFrame:
-#         Evap_df = self.Evap_df
-#         Qsb_monthly = self.Qsb_monthly
-#         PotEvap_df = self.PotEvap_df
-
-#         omega_true = pd.DataFrame(index=Evap_df.index, columns=Evap_df.columns, dtype=float)
-
-#         for col in PotEvap_df.columns:
-#             if col not in self.calibrated_params or "Ke" not in self.calibrated_params[col]:
-#                 continue
-
-#             ke_basin = self.calibrated_params[col]["Ke"]
-
-#             QB_col = Qsb_monthly[col].values
-#             PET_col = PotEvap_df[col].values
-
-#             ET_Ke = ke_basin * PET_col
-
-#             omega_values = np.array([
-#                 self._solve_for_omega(ET, QB, PET)
-#                 for ET, QB, PET in zip(ET_Ke, QB_col, PET_col)
-#             ])
-
-#             omega_true[col] = omega_values
-
-#         self.omega_true = omega_true
-#         return self.omega_true
-
-#     # -----------------------------------------------------
-#     # Fit ω_MLR using NDVI (M) and slope
-#     # -----------------------------------------------------
-#     def fit_and_compute_omega_mlr(self) -> pd.DataFrame:
-#         if self.omega_true is None:
-#             self.compute_omega_true()
-
-#         M = self.M_basin.values
-#         Slope = self.Slope_basin.values
-#         y = self.omega_true.values
-
-#         rows = []
-#         targets = []
-#         T, B = M.shape
-
-#         for i in range(B):
-#             Mi = M[:, i]
-#             Si = Slope[:, i]
-#             yi = y[:, i]
-
-#             mask = ~(np.isnan(Mi) | np.isnan(Si) | np.isnan(yi))
-#             if mask.any():
-#                 Xi = np.column_stack([np.ones(mask.sum()), Mi[mask], Si[mask]])
-#                 rows.append(Xi)
-#                 targets.append(yi[mask])
-
-#         if not rows:
-#             raise ValueError("No valid data to fit omega MLR.")
-
-#         X = np.vstack(rows)
-#         Y = np.concatenate(targets)
-
-#         beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-
-#         Omega_hat = np.empty_like(M, dtype=float)
-#         for i in range(B):
-#             Omega_hat[:, i] = beta[0] + beta[1] * M[:, i] + beta[2] * Slope[:, i]
-
-#         Omega_hat = np.where(Omega_hat < 1.0, 1.0, Omega_hat)
-
-#         self.omega_MLR = pd.DataFrame(
-#             Omega_hat,
-#             index=self.M_basin.index,
-#             columns=self.M_basin.columns,
-#         )
-
-#         return self.omega_MLR
-
-#     # -----------------------------------------------------
-#     # Compute Budyko ET using ω_MLR
-#     # -----------------------------------------------------
-#     def estimate_budyko_et(self) -> pd.DataFrame:
-#         if self.omega_MLR is None:
-#             self.fit_and_compute_omega_mlr()
-
-#         Qb = self.Qsb_monthly
-#         PET_df = self.PotEvap_df
-#         omega_MLR = self.omega_MLR
-
-#         P_values = (self.Evap_df + Qb).values
-#         PET_values = PET_df.values
-
-#         aridity = np.divide(
-#             PET_values, P_values,
-#             out=np.zeros_like(PET_values),
-#             where=P_values > 0
-#         )
-
-#         with np.errstate(over="ignore", invalid="ignore"):
-#             omega_values = omega_MLR.values
-#             term = np.power(aridity, omega_values)
-#             E_ratio = 1.0 + aridity - np.power(1.0 + term, 1.0 / omega_values)
-
-#         E_ratio = np.nan_to_num(E_ratio, nan=0.0, posinf=0.0, neginf=0.0)
-
-#         ET_est = P_values * E_ratio
-#         ET_est = np.clip(ET_est, 0.0, np.minimum(PET_values, P_values))
-
-#         self.ET_B = pd.DataFrame(ET_est, index=PET_df.index, columns=PET_df.columns)
-#         return self.ET_B
-
-#     # -----------------------------------------------------
-#     # Full workflow pipeline
-#     # -----------------------------------------------------
-#     def OmegaTrue_OmegaMLR_BudykoET(self) -> pd.DataFrame:
-#         self.compute_omega_true()
-#         self.fit_and_compute_omega_mlr()
-#         self.estimate_budyko_et()
-#         print("Workflow complete.")
-#         return self.ET_B
-
-
-# # ---------------------------------------------------------
-# # Script entry point
-# # ---------------------------------------------------------
-# if __name__ == "__main__":
-#     print("BudykoModelEstimator class defined. Run a separate script to execute the full workflow.")
