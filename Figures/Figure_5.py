@@ -231,7 +231,7 @@ def plot_ridge(ax, cv_long, levels):
     for i,var in enumerate(levels):
         lab = stats.loc[stats["variable"]==var,"label"].values
         ax.text(5, i+0.4, lab[0] if lab.size else "μ=NA",
-                ha="right", va="bottom", fontsize=10,
+                ha="right", va="bottom", fontsize=12,
                 fontproperties=font_prop)
 
 
@@ -363,8 +363,8 @@ def plot_scatter(ax, sdf):
               loc="lower right", ncol=1)
 
     ax.set_xlim(-3, 1.2); ax.set_ylim(-3, 1.2)
-    ax.set_xlabel("KGE (Budyko scenario)", fontsize=FS)
-    ax.set_ylabel("KGE (DA scenario)",     fontsize=FS)
+    ax.set_xlabel("Budyko", fontsize=FS)
+    ax.set_ylabel("DA",     fontsize=FS)
     ax.tick_params(labelsize=FS_TICK)
     ax.set_title("(c)",
                  loc="left", fontweight="bold", fontsize=FS_TITLE)
@@ -407,6 +407,7 @@ def plot_heatmap(ax, df, title, border_col, show_ylabel=True):
     cmap = plt.cm.RdBu_r.copy(); cmap.set_bad("lightgray")
     im = ax.imshow(np.ma.masked_invalid(corr.values),
                    cmap="coolwarm", vmin=-1, vmax=1, aspect="auto")
+
     n = len(corr.columns)
     ax.set_xticks(range(n))
     ax.set_xticklabels(corr.columns, rotation=45,
