@@ -474,7 +474,7 @@ def plot_streamflow_skill_figure(
         ax_fdc.plot(exceed, q, color=p["color"], lw=p["lw"], ls=p["ls"], label=p["label"])
     ax_fdc.set_yscale("log")
     ax_fdc.set_xlabel("Exc. probability (%)"); ax_fdc.set_ylabel("Q (mm/month, log)")
-    ax_fdc.set_title("(i) Flow duration curves", loc="left", fontweight="bold")
+    ax_fdc.set_title("(j) Flow duration curves", loc="left", fontweight="bold")
     ax_fdc.legend(loc="lower left", ncol=2, frameon=False, fontsize=12)
 
     # ── (j) CDF of KGE, basin-wise vs global ────────────────────────────
@@ -486,7 +486,7 @@ def plot_streamflow_skill_figure(
                        label=f"{PRODUCTS_Q[k]['label']} ({cal_label})")
     ax_cdf.set_xlabel("KGE"); ax_cdf.set_ylabel("Cum. fraction")
     ax_cdf.legend(fontsize=12, ncol=2, frameon=False)
-    ax_cdf.set_title("(j) CDF of KGE", loc="left", fontweight="bold")
+    ax_cdf.set_title("(i) CDF of KGE", loc="left", fontweight="bold")
     ax_cdf.set_xlim(-15, 1)
 
     # ── (k) Peak-magnitude error (basin-wise) ───────────────────────────

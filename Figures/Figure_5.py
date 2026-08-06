@@ -35,10 +35,10 @@ DIR_DA     = os.path.join(SIM,"BUDYKO_DA")
 SCEN_COLORS = {"Base":"#1528D8","Budyko":"#f30af3","DA":"darkgreen"}
 SCEN_ORDER  = ["Base","Budyko","DA"]
 
-FS       = 16
-FS_TITLE = 14
-FS_TICK  = 14
-FS_ANNOT = 14
+FS       = 18
+FS_TITLE = 16
+FS_TICK  = 16
+FS_ANNOT = 16
 
 # ── Vegetation classification from omega ─────────────────────────────────
 # Higher omega = more vegetated = more ET-controlled catchment
@@ -202,7 +202,7 @@ def plot_ridge(ax, cv_long, levels):
                   var_cv=lambda x: np.nanvar(x, ddof=1)).reset_index())
     stats["label"] = stats.apply(
         lambda r: "μ=NA" if pd.isna(r["mean_cv"])
-        else f"μ={r['mean_cv']:.3f}, var={r['var_cv']:.3f}", axis=1)
+        else f"μ={r['mean_cv']:.2f}, var={r['var_cv']:.2f}", axis=1)
 
     x_grid = np.linspace(-1, 5, 500)
     rc = cm.get_cmap("jet", len(levels))
@@ -231,7 +231,7 @@ def plot_ridge(ax, cv_long, levels):
     for i,var in enumerate(levels):
         lab = stats.loc[stats["variable"]==var,"label"].values
         ax.text(5, i+0.4, lab[0] if lab.size else "μ=NA",
-                ha="right", va="bottom", fontsize=12,
+                ha="right", va="bottom", fontsize=14,
                 fontproperties=font_prop)
 
 
@@ -311,7 +311,7 @@ def plot_scatter(ax, sdf):
                      loc="left",fontweight="bold",fontsize=FS_TITLE)
         return
 
-    cmap  = plt.cm.bwr_r
+    cmap  = plt.cm.jet
     omega_vals = sdf["omega"]
     norm  = mcolors.Normalize(vmin=0.5,
                                vmax=3.5)
@@ -327,7 +327,7 @@ def plot_scatter(ax, sdf):
                         edgecolors="gray", linewidths=0.4, zorder=4)
 
     # 1:1 line
-    ax.plot([-5,1],[-5,1], "k--", lw=1.0, alpha=0.5, zorder=2)
+    ax.plot([-15,1],[-15,1], "k--", lw=1.5, alpha=0.5, zorder=2)
 
     # # KGE = 0.5 reference lines
     # ax.axhline(0.5, color="gray", lw=0.8, ls=(0,(4,3)), alpha=0.5)
@@ -362,7 +362,7 @@ def plot_scatter(ax, sdf):
               title_fontsize=14,
               loc="lower right", ncol=1)
 
-    ax.set_xlim(-3, 1.2); ax.set_ylim(-3, 1.2)
+    ax.set_xlim(-10, 1.2); ax.set_ylim(-10, 1.2)
     ax.set_xlabel("Budyko", fontsize=FS)
     ax.set_ylabel("DA",     fontsize=FS)
     ax.tick_params(labelsize=FS_TICK)
@@ -440,7 +440,7 @@ def plot_heatmap(ax, df, title, border_col, show_ylabel=True):
 # ════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════
-def plot_mechanism_figure(out_dir, fname="Figure_4_mechanism"):
+def plot_mechanism_figure(out_dir, fname="Figure_5"):
     print("Computing WB residuals...")
     wb = compute_wb()
 
@@ -455,7 +455,7 @@ def plot_mechanism_figure(out_dir, fname="Figure_4_mechanism"):
                 for sc in ["Base","Budyko","DA"]}
 
     # ── Layout: 2 rows × 3 cols + colorbar col ───────────────────────
-    fig = plt.figure(figsize=(12, 10), dpi=200)
+    fig = plt.figure(figsize=(16, 12), dpi=200)
     gs  = gridspec.GridSpec(2, 4,
                              left=0.05, right=0.97,
                              top=0.95, bottom=0.10,
