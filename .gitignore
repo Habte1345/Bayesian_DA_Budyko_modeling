@@ -70,7 +70,6 @@ coverage.xml
 notebooks/notebook.ipynb
 notebooks/DA-ENKF.ipynb
 #############
-all_history.txt
 node_modules/
 bower_components/
 .grunt/
